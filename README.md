@@ -152,24 +152,4 @@ stock_prices_cleaned.xls
 stock_news_cleaned.xls
 ```
 
-### Optional documentation
-
-```text
-README.md
-proposal_app_README.md
-proposal_pipeline_README.md
-```
-
-### Optional university submission evidence
-
-```text
-Proposal F26-9 (1).pdf
-F26-9_Del4.pdf
-F26-9_Del3.py
-F26-9_Del4.py
-F26-9 Stock_Module.ipynb
-F26-9 News_Module.ipynb
-Del 5.png
-```
-
 Do not upload virtual-environment folders or local caches.

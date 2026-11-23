@@ -1,0 +1,115 @@
+{
+  "trading_days": 21,
+  "tickers": [
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA"
+  ],
+  "equal_weight_annualized_volatility": 0.45837495269261846,
+  "inverse_volatility_annualized_volatility": 0.36040072983880583,
+  "risk_reduction_percent": 21.374253169438152,
+  "recommended_action": "Inverse-volatility or signal-adjusted weights reduce the historical portfolio volatility baseline.",
+  "annualized_covariance": {
+    "AAPL": {
+      "AAPL": 0.0835457,
+      "AMZN": 0.06483728,
+      "GOOGL": 0.05043595,
+      "META": 0.07729144,
+      "MSFT": 0.07580994,
+      "NVDA": 0.13548066
+    },
+    "AMZN": {
+      "AAPL": 0.06483728,
+      "AMZN": 0.20498002,
+      "GOOGL": 0.19409414,
+      "META": 0.12505032,
+      "MSFT": 0.12180705,
+      "NVDA": 0.24562135
+    },
+    "GOOGL": {
+      "AAPL": 0.05043595,
+      "AMZN": 0.19409414,
+      "GOOGL": 0.34043405,
+      "META": 0.0884605,
+      "MSFT": 0.08767391,
+      "NVDA": 0.37005226
+    },
+    "META": {
+      "AAPL": 0.07729144,
+      "AMZN": 0.12505032,
+      "GOOGL": 0.0884605,
+      "META": 0.22407505,
+      "MSFT": 0.12171901,
+      "NVDA": 0.41810294
+    },
+    "MSFT": {
+      "AAPL": 0.07580994,
+      "AMZN": 0.12180705,
+      "GOOGL": 0.08767391,
+      "META": 0.12171901,
+      "MSFT": 0.15192703,
+      "NVDA": 0.19118101
+    },
+    "NVDA": {
+      "AAPL": 0.13548066,
+      "AMZN": 0.24562135,
+      "GOOGL": 0.37005226,
+      "META": 0.41810294,
+      "MSFT": 0.19118101,
+      "NVDA": 1.82367615
+    }
+  },
+  "correlation": {
+    "AAPL": {
+      "AAPL": 1.0,
+      "AMZN": 0.49545815,
+      "GOOGL": 0.29906226,
+      "META": 0.56490135,
+      "MSFT": 0.67289382,
+      "NVDA": 0.34708943
+    },
+    "AMZN": {
+      "AAPL": 0.49545815,
+      "AMZN": 1.0,
+      "GOOGL": 0.73475096,
+      "META": 0.58348849,
+      "MSFT": 0.69023841,
+      "NVDA": 0.40173206
+    },
+    "GOOGL": {
+      "AAPL": 0.29906226,
+      "AMZN": 0.73475096,
+      "GOOGL": 1.0,
+      "META": 0.32028468,
+      "MSFT": 0.38551064,
+      "NVDA": 0.46964825
+    },
+    "META": {
+      "AAPL": 0.56490135,
+      "AMZN": 0.58348849,
+      "GOOGL": 0.32028468,
+      "META": 1.0,
+      "MSFT": 0.65969641,
+      "NVDA": 0.65405251
+    },
+    "MSFT": {
+      "AAPL": 0.67289382,
+      "AMZN": 0.69023841,
+      "GOOGL": 0.38551064,
+      "META": 0.65969641,
+      "MSFT": 1.0,
+      "NVDA": 0.36320629
+    },
+    "NVDA": {
+      "AAPL": 0.34708943,
+      "AMZN": 0.40173206,
+      "GOOGL": 0.46964825,
+      "META": 0.65405251,
+      "MSFT": 0.36320629,
+      "NVDA": 1.0
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "stock_features": [
+    "Daily_Return",
+    "MA_10",
+    "MA_20",
+    "Price_Range",
+    "Volume_Change",
+    "Close_MA10_Ratio",
+    "Close_MA20_Ratio",
+    "RSI_14",
+    "MACD",
+    "MACD_Signal",
+    "News_Sentiment",
+    "News_Sentiment_Count"
+  ],
+  "split": "chronological 80/20",
+  "train_rows": 29514,
+  "test_rows": 9036,
+  "final_training_rows": 38550,
+  "accuracy": 0.5153829127932713,
+  "f1": 0.5640617222498756,
+  "ticker_stability": {
+    "AAPL": {
+      "rows": 1506,
+      "accuracy": 0.5245683930942895,
+      "f1": 0.625914315569488
+    },
+    "AMZN": {
+      "rows": 1506,
+      "accuracy": 0.5139442231075697,
+      "f1": 0.6242299794661191
+    },
+    "GOOGL": {
+      "rows": 1506,
+      "accuracy": 0.5424966799468791,
+      "f1": 0.6352567496029645
+    },
+    "META": {
+      "rows": 1506,
+      "accuracy": 0.49800796812749004,
+      "f1": 0.4009508716323296
+    },
+    "MSFT": {
+      "rows": 1506,
+      "accuracy": 0.5172642762284196,
+      "f1": 0.5044308111792775
+    },
+    "NVDA": {
+      "rows": 1506,
+      "accuracy": 0.4960159362549801,
+      "f1": 0.5150159744408945
+    }
+  },
+  "strategy_final_return": 2.802844181341405,
+  "buy_hold_final_return": 3.247006223886312,
+  "news_model": {
+    "training_rows": 48,
+    "training_accuracy": 1.0,
+    "label_distribution": {
+      "-1": 2,
+      "0": 41,
+      "1": 5
+    }
+  }
+}

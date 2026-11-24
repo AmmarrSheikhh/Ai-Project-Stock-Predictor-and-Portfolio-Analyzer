@@ -9,16 +9,22 @@ not be used as investment advice.
 
 ## Features
 
-- Random Forest stock direction prediction
+- Random Forest or Logistic Regression stock direction prediction
 - RSI-14 and MACD technical indicators
 - TF-IDF and Logistic Regression news sentiment
 - News sentiment merged into stock model features
+- Adjustable technical/news signal weighting
 - Chronological 80/20 stock evaluation
-- Buy-and-Hold versus strategy backtesting
+- Majority-baseline and classifier model comparison
+- Per-ticker Buy-and-Hold versus cost-adjusted strategy backtesting
 - Ticker-level accuracy and F1 stability
-- Covariance and correlation analysis
-- Equal-weight and inverse-volatility portfolio comparison
+- User-selected stock baskets
+- Covariance-based Markowitz minimum-variance optimization
+- Equal-weight, inverse-volatility, Markowitz, and signal-adjusted allocation comparison
 - Signal-adjusted portfolio allocations
+- Historical low/base/high investment scenarios
+- Persistent human news labels that override sentiment immediately and are
+  included in future model retraining
 - Live Yahoo Finance or uploaded-file inputs
 - Saved model retraining and prediction
 - Cyberpunk neon Streamlit interface
@@ -51,28 +57,56 @@ The predictions use the saved models. The page supports:
 - Viewing all available stocks
 - Searching for a specific ticker
 - Selecting one stock for a focused view
+- Choosing Random Forest or Logistic Regression after retraining
+- Adjusting the technical-versus-news signal blend
 - Stock probability and combined-signal charts
 - Downloadable prediction CSV files
 
 ### Portfolio
 
-Calculates:
+Choose a basket of supported tickers and calculate:
 
 - Annualized covariance
 - Correlation
 - Equal-weight portfolio volatility
 - Inverse-volatility portfolio volatility
+- Markowitz minimum-variance allocations
 - Signal-adjusted allocation suggestions
+- Dollar allocations for a user-entered investment amount
+- Historical low/base/high value scenarios over a selectable horizon
+
+The scenarios use historical basket returns and are illustrative, not forecasts
+or guarantees. They assume daily rebalancing at the selected allocation.
+
+### News Review
+
+Review current Yahoo headlines or uploaded news and label each headline as
+positive, neutral, negative, or use the model's sentiment. Saved labels are
+stored in `proposal_pipeline_outputs/proposal_news_labels.csv`, override
+sentiment in subsequent predictions, and are included when the models are
+retrained.
+
+### Model Status
+
+Displays stored model metrics, ticker stability, model comparisons, and
+selectable per-ticker backtest curves. Strategy curves include 10 basis points
+of transaction cost per position change.
 
 ### Retrain
 
 Retrains and replaces the proposal-aligned stock and news models.
 
 Retraining is intentional and should not run automatically on every prediction.
+Each successful run is recorded in
+`proposal_pipeline_outputs/proposal_training_history.csv` with its timestamp,
+data sources and date coverage, row counts, model scores, backtest returns, and
+training duration. The page shows the latest run and recent history and lets
+you download the full log.
 
 ### Model Status
 
-Displays stored model metrics, ticker stability, backtest values, and limitations.
+Displays stored model metrics, ticker stability, model comparisons, per-ticker
+backtest curves, and project limitations.
 
 ## Upload file formats
 
@@ -112,6 +146,7 @@ Optional columns:
 - pandas
 - NumPy
 - scikit-learn
+- SciPy
 - yfinance
 - joblib
 - openpyxl
@@ -136,7 +171,8 @@ The recommended free deployment target is Streamlit Community Cloud.
 - News weak labels can be incorrect.
 - Yahoo Finance availability and rate limits can affect live downloads.
 - Retraining may need a network connection.
-- The project does not include transaction costs or real-time trading.
+- Backtests include 10 bps per position change, but do not model taxes,
+  slippage, liquidity, or live trading.
 
 ## Repository file guide
 

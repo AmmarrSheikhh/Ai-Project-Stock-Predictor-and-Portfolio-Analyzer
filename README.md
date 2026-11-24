@@ -143,6 +143,7 @@ Optional columns:
 - Internet access for Yahoo Finance live data
 - Streamlit
 - Plotly
+- Matplotlib
 - pandas
 - NumPy
 - scikit-learn

@@ -9,15 +9,19 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "proposal_pipeline_outputs"
+NEWS_LABELS_PATH = OUT / "proposal_news_labels.csv"
+TRAINING_HISTORY_PATH = OUT / "proposal_training_history.csv"
 TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
 
 BASE_FEATURES = [
@@ -46,6 +50,93 @@ NEGATIVE_WORDS = {
 
 class InputError(ValueError):
     pass
+
+
+def load_manual_news_labels() -> pd.DataFrame:
+    if not NEWS_LABELS_PATH.exists():
+        return pd.DataFrame(columns=["Ticker", "Headline", "Label"])
+    labels = pd.read_csv(NEWS_LABELS_PATH)
+    required = {"Ticker", "Headline", "Label"}
+    if not required.issubset(labels.columns):
+        raise InputError(
+            f"Manual news labels must contain: {', '.join(sorted(required))}."
+        )
+    labels["Label"] = pd.to_numeric(labels["Label"], errors="coerce")
+    if labels["Label"].isna().any() or not labels["Label"].isin([-1, 0, 1]).all():
+        raise InputError("Saved manual news labels must be -1, 0, or 1.")
+    return labels[["Ticker", "Headline", "Label"]]
+
+
+def save_manual_news_labels(labels: pd.DataFrame) -> None:
+    required = {"Ticker", "Headline", "Label"}
+    if not required.issubset(labels.columns):
+        raise InputError(
+            f"Manual news labels must contain: {', '.join(sorted(required))}."
+        )
+    cleaned = labels.loc[:, ["Ticker", "Headline", "Label"]].copy()
+    cleaned["Ticker"] = cleaned["Ticker"].fillna("").astype(str).str.strip().str.upper()
+    cleaned["Headline"] = cleaned["Headline"].fillna("").astype(str).str.strip()
+    cleaned["Label"] = pd.to_numeric(cleaned["Label"], errors="coerce")
+    cleaned = cleaned.dropna(subset=["Label"])
+    if not cleaned["Label"].isin([-1, 0, 1]).all():
+        raise InputError("Manual news labels must be -1, 0, or 1.")
+    cleaned = cleaned[
+        cleaned["Ticker"].ne("") & cleaned["Headline"].ne("")
+    ].drop_duplicates(["Ticker", "Headline"], keep="last")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    temporary = NEWS_LABELS_PATH.with_suffix(".csv.tmp")
+    cleaned.to_csv(temporary, index=False)
+    temporary.replace(NEWS_LABELS_PATH)
+
+
+def _news_label_key(frame: pd.DataFrame) -> pd.Series:
+    ticker = frame["Ticker"].fillna("").astype(str).str.strip().str.upper()
+    headline = (
+        frame["Headline"].fillna("").astype(str).str.lower()
+        .str.replace(r"\s+", " ", regex=True).str.strip()
+    )
+    return ticker + "\0" + headline
+
+
+def update_manual_news_labels(reviewed_news: pd.DataFrame) -> None:
+    required = {"Ticker", "Headline", "Label"}
+    if not required.issubset(reviewed_news.columns):
+        raise InputError(
+            f"Reviewed news must contain: {', '.join(sorted(required))}."
+        )
+    current = reviewed_news.loc[:, ["Ticker", "Headline", "Label"]].copy()
+    current["Label"] = pd.to_numeric(current["Label"], errors="coerce")
+    current_keys = set(_news_label_key(current))
+    existing = load_manual_news_labels()
+    if not existing.empty:
+        existing = existing.loc[~_news_label_key(existing).isin(current_keys)]
+    save_manual_news_labels(pd.concat([existing, current], ignore_index=True))
+
+
+def apply_manual_news_labels(
+    news: pd.DataFrame, labels: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    prepared = news.copy()
+    if "Weak_Label" not in prepared.columns:
+        raise InputError("News data must be prepared before applying manual labels.")
+    if labels is None:
+        labels = load_manual_news_labels()
+
+    prepared["Manual_Label"] = np.nan
+    if labels.empty or prepared.empty:
+        return prepared
+
+    keyed_labels = labels.copy()
+    keyed_labels["Ticker"] = keyed_labels["Ticker"].fillna("").astype(str)
+    keyed_labels["Headline"] = keyed_labels["Headline"].fillna("").astype(str)
+    label_values = dict(zip(_news_label_key(keyed_labels), keyed_labels["Label"]))
+    prepared["Manual_Label"] = _news_label_key(prepared).map(label_values)
+    has_manual_label = prepared["Manual_Label"].notna()
+    prepared.loc[has_manual_label, "Weak_Label"] = prepared.loc[
+        has_manual_label, "Manual_Label"
+    ]
+    return prepared
 
 
 def read_table(path: str | Path) -> pd.DataFrame:
@@ -83,6 +174,7 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
 
     prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce", utc=True)
     prices["Date"] = prices["Date"].dt.tz_localize(None)
+    prices["Ticker"] = prices["Ticker"].astype(str).str.strip().str.upper()
     numeric = ["Open", "High", "Low", "Close", "Volume"]
     for column in numeric:
         prices[column] = pd.to_numeric(prices[column], errors="coerce")
@@ -194,6 +286,8 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
     if source is None:
         source = download_live_news()
     news = source.copy()
+    if "Headline" not in news.columns and "Clean_Headline" in news.columns:
+        news = news.rename(columns={"Clean_Headline": "Headline"})
     if "Headline" not in news.columns:
         raise InputError("News data must contain a Headline column.")
     news["Headline"] = news["Headline"].fillna("").astype(str)
@@ -201,6 +295,7 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
 
     if "Ticker" not in news.columns:
         news["Ticker"] = "UNKNOWN"
+    news["Ticker"] = news["Ticker"].fillna("UNKNOWN").astype(str).str.strip().str.upper()
 
     if "PublishedAt" in news.columns:
         news["PublishedAt"] = pd.to_datetime(
@@ -266,7 +361,7 @@ def train_news_model(news: pd.DataFrame) -> tuple[Pipeline, dict]:
     return model, {
         "training_rows": int(len(news)),
         "training_accuracy": float(
-            accuracy_score(news["Weak_Label"], predicted)
+            accuracy_score(news["Weak_Label"].astype(int), predicted)
         ),
         "label_distribution": {
             str(label): int(count)
@@ -285,8 +380,26 @@ def add_targets(prices: pd.DataFrame) -> pd.DataFrame:
 
 def train_and_evaluate(
     prices: pd.DataFrame, news: pd.DataFrame
-) -> tuple[RandomForestClassifier, Pipeline, dict, pd.DataFrame, pd.DataFrame]:
-    news_model, news_metrics = train_news_model(news)
+) -> tuple[
+    RandomForestClassifier, Pipeline, Pipeline, dict, pd.DataFrame, pd.DataFrame
+]:
+    news = apply_manual_news_labels(news)
+    manual_training = load_manual_news_labels().rename(
+        columns={"Label": "Weak_Label"}
+    )
+    news_training = pd.concat(
+        [
+            news[["Ticker", "Headline", "Weak_Label"]],
+            manual_training[["Ticker", "Headline", "Weak_Label"]],
+        ],
+        ignore_index=True,
+    )
+    news_training["_label_key"] = _news_label_key(news_training)
+    news_training = news_training.drop_duplicates(
+        "_label_key", keep="last"
+    ).drop(columns="_label_key")
+    news_model, news_metrics = train_news_model(news_training)
+    news_metrics["manual_label_rows"] = int(len(manual_training))
     merged = merge_daily_sentiment(prices, news)
     labeled = add_targets(merged)
     if len(labeled) < 100:
@@ -298,6 +411,8 @@ def train_and_evaluate(
     test = labeled[labeled["Date"] >= cutoff]
     if train.empty or test.empty:
         raise InputError("The data cannot produce a chronological 80/20 split.")
+    if train["Target_Up"].nunique() < 2:
+        raise InputError("Stock training data must contain both up and down targets.")
 
     model = RandomForestClassifier(
         n_estimators=250,
@@ -308,12 +423,27 @@ def train_and_evaluate(
         n_jobs=-1,
     )
     model.fit(train[STOCK_FEATURES], train["Target_Up"].astype(int))
+    logistic_model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", LogisticRegression(
+            max_iter=1000,
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+    logistic_model.fit(train[STOCK_FEATURES], train["Target_Up"].astype(int))
 
-    probabilities = model.predict_proba(test[STOCK_FEATURES])[:, 1]
-    predictions = model.predict(test[STOCK_FEATURES])
+    rf_probabilities = model.predict_proba(test[STOCK_FEATURES])[:, 1]
+    rf_predictions = model.predict(test[STOCK_FEATURES])
+    lr_probabilities = logistic_model.predict_proba(test[STOCK_FEATURES])[:, 1]
+    lr_predictions = logistic_model.predict(test[STOCK_FEATURES])
     test_output = test.copy()
-    test_output["Predicted_Up"] = predictions
-    test_output["Prediction_Probability"] = probabilities
+    test_output["Predicted_Up"] = rf_predictions
+    test_output["Prediction_Probability"] = rf_probabilities
+    test_output["Random_Forest_Predicted_Up"] = rf_predictions
+    test_output["Random_Forest_Probability"] = rf_probabilities
+    test_output["Logistic_Regression_Predicted_Up"] = lr_predictions
+    test_output["Logistic_Regression_Probability"] = lr_probabilities
 
     ticker_stability = {}
     for ticker, group in test_output.groupby("Ticker"):
@@ -335,24 +465,69 @@ def train_and_evaluate(
     test_output["Next_Day_Return"] = (
         test_output["Next_Close"] / test_output["Close"]
     ) - 1
-    strategy_returns = (
-        test_output["Prediction_Probability"].gt(0.5).astype(float)
-        * test_output["Next_Day_Return"].fillna(0)
+    test_output["BuyHold_Cumulative_Value"] = (
+        (1 + test_output["Next_Day_Return"].fillna(0))
+        .groupby(test_output["Ticker"]).cumprod()
+    )
+    transaction_cost = 0.001
+    strategy_returns = {}
+    for prefix, probability_column in [
+        ("Random_Forest", "Random_Forest_Probability"),
+        ("Logistic_Regression", "Logistic_Regression_Probability"),
+    ]:
+        position = test_output[probability_column].gt(0.5).astype(float)
+        turnover = position.groupby(test_output["Ticker"]).diff().abs().fillna(0)
+        returns = (
+            position * test_output["Next_Day_Return"].fillna(0)
+            - turnover * transaction_cost
+        )
+        test_output[f"{prefix}_Strategy_Return"] = returns
+        test_output[f"{prefix}_Cumulative_Value"] = (
+            (1 + returns).groupby(test_output["Ticker"]).cumprod()
+        )
+        strategy_returns[prefix] = returns
+
+    test_output["Strategy_Return"] = test_output["Random_Forest_Strategy_Return"]
+    test_output["Strategy_Cumulative_Return"] = (
+        test_output["Random_Forest_Cumulative_Value"]
+    )
+    test_output["BuyHold_Cumulative_Return"] = (
+        test_output["BuyHold_Cumulative_Value"]
     )
     strategy_daily = (
-        test_output.assign(Strategy_Return=strategy_returns)
-        .groupby("Date")["Strategy_Return"]
-        .mean()
+        test_output.assign(Strategy_Return=strategy_returns["Random_Forest"])
+        .groupby("Date")["Strategy_Return"].mean()
+    )
+    logistic_daily = (
+        test_output.assign(
+            Strategy_Return=strategy_returns["Logistic_Regression"]
+        )
+        .groupby("Date")["Strategy_Return"].mean()
     )
     buy_hold_daily = test_output.groupby("Date")["Next_Day_Return"].mean()
 
     strategy_curve = (1 + strategy_daily.fillna(0)).cumprod()
+    logistic_curve = (1 + logistic_daily.fillna(0)).cumprod()
     buy_hold_curve = (1 + buy_hold_daily.fillna(0)).cumprod()
 
     backtest = pd.DataFrame({
-        "Date": strategy_curve.index,
-        "Strategy_Cumulative_Return": strategy_curve.to_numpy(),
-        "BuyHold_Cumulative_Return": buy_hold_curve.reindex(strategy_curve.index).fillna(0).add(1).cumprod().to_numpy(),
+        "Date": test_output["Date"].to_numpy(),
+        "Ticker": test_output["Ticker"].to_numpy(),
+        "BuyHold_Cumulative_Value": test_output[
+            "BuyHold_Cumulative_Value"
+        ].to_numpy(),
+        "Random_Forest_Cumulative_Value": test_output[
+            "Random_Forest_Cumulative_Value"
+        ].to_numpy(),
+        "Logistic_Regression_Cumulative_Value": test_output[
+            "Logistic_Regression_Cumulative_Value"
+        ].to_numpy(),
+        "Strategy_Cumulative_Return": test_output[
+            "Random_Forest_Cumulative_Value"
+        ].to_numpy(),
+        "BuyHold_Cumulative_Return": test_output[
+            "BuyHold_Cumulative_Value"
+        ].to_numpy(),
     })
 
     final_model = RandomForestClassifier(
@@ -364,7 +539,52 @@ def train_and_evaluate(
         n_jobs=-1,
     )
     final_model.fit(labeled[STOCK_FEATURES], labeled["Target_Up"].astype(int))
+    final_logistic_model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", LogisticRegression(
+            max_iter=1000,
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+    final_logistic_model.fit(
+        labeled[STOCK_FEATURES], labeled["Target_Up"].astype(int)
+    )
 
+    model_comparison = {
+        "Majority Class Baseline": {
+            "accuracy": float(accuracy_score(
+                test["Target_Up"], np.full(len(test), train["Target_Up"].mode()[0])
+            )),
+            "f1": float(f1_score(
+                test["Target_Up"],
+                np.full(len(test), train["Target_Up"].mode()[0]),
+                zero_division=0,
+            )),
+        },
+        "Logistic Regression": {
+            "accuracy": float(accuracy_score(
+                test_output["Target_Up"],
+                test_output["Logistic_Regression_Predicted_Up"],
+            )),
+            "f1": float(f1_score(
+                test_output["Target_Up"],
+                test_output["Logistic_Regression_Predicted_Up"],
+                zero_division=0,
+            )),
+        },
+        "Random Forest": {
+            "accuracy": float(accuracy_score(
+                test_output["Target_Up"],
+                test_output["Random_Forest_Predicted_Up"],
+            )),
+            "f1": float(f1_score(
+                test_output["Target_Up"],
+                test_output["Random_Forest_Predicted_Up"],
+                zero_division=0,
+            )),
+        },
+    }
     metrics = {
         "stock_features": STOCK_FEATURES,
         "split": "chronological 80/20",
@@ -372,25 +592,40 @@ def train_and_evaluate(
         "test_rows": int(len(test)),
         "final_training_rows": int(len(labeled)),
         "accuracy": float(
-            accuracy_score(test_output["Target_Up"], test_output["Predicted_Up"])
+            accuracy_score(
+                test_output["Target_Up"],
+                test_output["Random_Forest_Predicted_Up"],
+            )
         ),
         "f1": float(
             f1_score(
                 test_output["Target_Up"],
-                test_output["Predicted_Up"],
+                test_output["Random_Forest_Predicted_Up"],
                 zero_division=0,
             )
         ),
+        "model_comparison": model_comparison,
         "ticker_stability": ticker_stability,
         "strategy_final_return": float(
             strategy_curve.iloc[-1] - 1
         ) if len(strategy_curve) else 0.0,
+        "logistic_strategy_final_return": float(
+            logistic_curve.iloc[-1] - 1
+        ) if len(logistic_curve) else 0.0,
         "buy_hold_final_return": float(
             buy_hold_curve.iloc[-1] - 1
-        ) if len(strategy_curve) else 0.0,
+        ) if len(buy_hold_curve) else 0.0,
+        "backtest_transaction_cost_bps": 10,
         "news_model": news_metrics,
     }
-    return final_model, news_model, metrics, test_output, backtest
+    return (
+        final_model,
+        final_logistic_model,
+        news_model,
+        metrics,
+        test_output,
+        backtest,
+    )
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -399,8 +634,23 @@ def write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def append_training_record(record: dict[str, str | int | float]) -> None:
+    if "Trained_At_UTC" not in record:
+        raise InputError("Training history records need a UTC timestamp.")
+    OUT.mkdir(parents=True, exist_ok=True)
+    if TRAINING_HISTORY_PATH.exists():
+        history = pd.read_csv(TRAINING_HISTORY_PATH)
+    else:
+        history = pd.DataFrame()
+    history = pd.concat([history, pd.DataFrame([record])], ignore_index=True)
+    temporary = TRAINING_HISTORY_PATH.with_suffix(".csv.tmp")
+    history.to_csv(temporary, index=False)
+    temporary.replace(TRAINING_HISTORY_PATH)
+
+
 def save_models(
     stock_model: RandomForestClassifier,
+    logistic_model: Pipeline,
     news_model: Pipeline,
     metrics: dict,
     backtest: pd.DataFrame,
@@ -408,41 +658,69 @@ def save_models(
 ) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     stock_path = OUT / "proposal_stock_model.joblib"
+    logistic_path = OUT / "proposal_logistic_model.joblib"
     news_path = OUT / "proposal_news_model.joblib"
     joblib.dump(stock_model, stock_path)
+    joblib.dump(logistic_model, logistic_path)
     joblib.dump(news_model, news_path)
     write_json(OUT / "proposal_metrics.json", metrics)
     backtest.to_csv(OUT / "proposal_backtest.csv", index=False)
     test_output.to_csv(OUT / "proposal_stock_test_predictions.csv", index=False)
 
 
-def load_models() -> tuple[RandomForestClassifier, Pipeline]:
+def load_models() -> tuple[RandomForestClassifier, Pipeline | None, Pipeline]:
     stock_path = OUT / "proposal_stock_model.joblib"
+    logistic_path = OUT / "proposal_logistic_model.joblib"
     news_path = OUT / "proposal_news_model.joblib"
     if not stock_path.exists() or not news_path.exists():
         raise InputError(
             "Proposal models are not trained yet. Run: "
             "python proposal_pipeline.py train"
         )
-    return joblib.load(stock_path), joblib.load(news_path)
+    logistic_model = joblib.load(logistic_path) if logistic_path.exists() else None
+    return joblib.load(stock_path), logistic_model, joblib.load(news_path)
+
+
+def apply_signal_weights(
+    combined: pd.DataFrame, technical_weight: float = 0.7
+) -> pd.DataFrame:
+    if not 0 <= technical_weight <= 1:
+        raise InputError("Technical signal weight must be between 0 and 1.")
+    weighted = combined.copy()
+    weighted["Combined_Signal"] = (
+        technical_weight * weighted["Prediction_Probability"]
+        + (1 - technical_weight) * weighted["Sentiment_Signal"]
+    )
+    weighted["Combined_Direction"] = np.where(
+        weighted["Combined_Signal"] >= 0.5,
+        "UP",
+        "DOWN",
+    )
+    return weighted
 
 
 def predict_with_models(
-    stock_model: RandomForestClassifier,
+    stock_model: RandomForestClassifier | Pipeline,
     news_model: Pipeline,
     prices: pd.DataFrame,
     news: pd.DataFrame,
+    technical_weight: float = 0.7,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared_prices = prepare_prices(prices)
-    prepared_news = prepare_news(news)
+    prepared_news = apply_manual_news_labels(prepare_news(news))
 
     news_predictions = prepared_news.copy()
     news_predictions["Predicted_Sentiment"] = news_model.predict(
         news_predictions["Headline"]
     )
+    manually_labeled = news_predictions["Manual_Label"].notna()
+    news_predictions.loc[manually_labeled, "Predicted_Sentiment"] = (
+        news_predictions.loc[manually_labeled, "Manual_Label"]
+    )
     news_predictions["Sentiment_Confidence"] = news_model.predict_proba(
         news_predictions["Headline"]
     ).max(axis=1)
+    news_predictions.loc[manually_labeled, "Sentiment_Confidence"] = 1.0
 
     merged = merge_daily_sentiment(prepared_prices, prepared_news)
     usable = merged.dropna(subset=STOCK_FEATURES)
@@ -488,30 +766,28 @@ def predict_with_models(
     combined["Sentiment_Signal"] = (
         combined["Predicted_Sentiment_Mean"] + 1
     ) / 2
-    combined["Combined_Signal"] = (
-        0.7 * combined["Prediction_Probability"]
-        + 0.3 * combined["Sentiment_Signal"]
-    )
-    combined["Combined_Direction"] = np.where(
-        combined["Combined_Signal"] >= 0.5,
-        "UP",
-        "DOWN",
-    )
-    return stock_output, combined
+    return stock_output, apply_signal_weights(combined, technical_weight)
 
 
 def build_portfolio(
     prices: pd.DataFrame,
     combined: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    selected_tickers: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     prepared = prepare_prices(prices)
     returns = prepared.pivot_table(
         index="Date",
         columns="Ticker",
         values="Daily_Return",
     )
+    requested_tickers = TICKERS if selected_tickers is None else selected_tickers
+    unknown_tickers = set(requested_tickers).difference(TICKERS)
+    if unknown_tickers:
+        raise InputError(
+            "Unsupported portfolio tickers: " + ", ".join(sorted(unknown_tickers))
+        )
     returns = returns.reindex(
-        columns=[ticker for ticker in TICKERS if ticker in returns.columns]
+        columns=[ticker for ticker in requested_tickers if ticker in returns.columns]
     ).dropna(how="any")
     if len(returns.columns) < 2:
         raise InputError(
@@ -530,6 +806,24 @@ def build_portfolio(
         inverse_volatility / inverse_volatility.sum(),
         index=covariance.index,
     )
+    optimization = minimize(
+        lambda candidate: float(
+            candidate @ covariance.to_numpy() @ candidate
+        ),
+        x0=equal_weights.to_numpy(),
+        method="SLSQP",
+        bounds=[(0.0, 1.0)] * len(equal_weights),
+        constraints={"type": "eq", "fun": lambda candidate: candidate.sum() - 1},
+        options={"maxiter": 1000, "ftol": 1e-12},
+    )
+    if not optimization.success:
+        raise InputError(
+            "Minimum-variance optimization failed: " + optimization.message
+        )
+    markowitz_weights = pd.Series(
+        optimization.x,
+        index=covariance.index,
+    )
 
     equal_risk = float(
         np.sqrt(
@@ -545,6 +839,13 @@ def build_portfolio(
             @ inverse_weights.to_numpy()
         )
     )
+    markowitz_risk = float(
+        np.sqrt(
+            markowitz_weights.to_numpy()
+            @ covariance.to_numpy()
+            @ markowitz_weights.to_numpy()
+        )
+    )
     risk_reduction = (
         (equal_risk - inverse_risk) / equal_risk * 100
         if equal_risk > 0
@@ -555,6 +856,7 @@ def build_portfolio(
         "Ticker": covariance.index,
         "Equal_Weight": equal_weights.to_numpy(),
         "Inverse_Volatility_Weight": inverse_weights.to_numpy(),
+        "Markowitz_Weight": markowitz_weights.to_numpy(),
         "Annualized_Volatility": annual_volatility,
     })
 
@@ -589,10 +891,15 @@ def build_portfolio(
         "tickers": list(covariance.index),
         "equal_weight_annualized_volatility": equal_risk,
         "inverse_volatility_annualized_volatility": inverse_risk,
+        "markowitz_annualized_volatility": markowitz_risk,
         "risk_reduction_percent": float(risk_reduction),
+        "markowitz_risk_reduction_percent": float(
+            (equal_risk - markowitz_risk) / equal_risk * 100
+            if equal_risk > 0 else 0
+        ),
         "recommended_action": (
-            "Inverse-volatility or signal-adjusted weights reduce the "
-            "historical portfolio volatility baseline."
+            "Markowitz weights minimize estimated variance for the selected "
+            "long-only basket using historical covariance."
         ),
         "annualized_covariance": covariance.round(8).to_dict(),
         "correlation": correlation.round(8).to_dict(),
@@ -600,6 +907,50 @@ def build_portfolio(
     covariance_output = covariance.reset_index().rename(columns={"index": "Ticker"})
     correlation_output = correlation.reset_index().rename(columns={"index": "Ticker"})
     return weights, covariance_output, correlation_output, metrics
+
+
+def project_investment(
+    prices: pd.DataFrame,
+    portfolio_weights: pd.Series,
+    initial_amount: float,
+    years: int,
+) -> dict[str, float | int]:
+    if initial_amount <= 0:
+        raise InputError("Investment amount must be greater than zero.")
+    if years < 1:
+        raise InputError("Projection horizon must be at least one year.")
+    weights = portfolio_weights.astype(float)
+    if weights.empty or not np.isclose(weights.sum(), 1.0):
+        raise InputError("Projection weights must add up to 100%.")
+
+    prepared = prepare_prices(prices)
+    close_prices = prepared.pivot_table(
+        index="Date",
+        columns="Ticker",
+        values="Close",
+    ).reindex(columns=weights.index).dropna(how="any")
+    returns = close_prices.pct_change().dropna(how="any")
+    if len(returns) < 2:
+        raise InputError("At least three aligned price observations are required.")
+
+    portfolio_returns = returns.mul(weights, axis="columns").sum(axis=1)
+    if (portfolio_returns <= -1).any():
+        raise InputError("Historical portfolio data contains invalid returns.")
+    daily_log_returns = np.log1p(portfolio_returns)
+    annual_log_return = float(daily_log_returns.mean() * 252)
+    annual_volatility = float(daily_log_returns.std(ddof=1) * np.sqrt(252))
+    horizon_volatility = annual_volatility * np.sqrt(years)
+    median_log_value = np.log(initial_amount) + annual_log_return * years
+
+    return {
+        "years": years,
+        "initial_amount": float(initial_amount),
+        "annualized_return": float(np.expm1(annual_log_return)),
+        "annualized_volatility": annual_volatility,
+        "low": float(np.exp(median_log_value - 1.644854 * horizon_volatility)),
+        "base": float(np.exp(median_log_value)),
+        "high": float(np.exp(median_log_value + 1.644854 * horizon_volatility)),
+    }
 
 
 def train_command(args: argparse.Namespace) -> int:
@@ -614,11 +965,17 @@ def train_command(args: argparse.Namespace) -> int:
         news = prepare_news(download_live_news())
 
     prepared = prepare_prices(prices)
-    stock_model, news_model, metrics, test_output, backtest = (
-        train_and_evaluate(prepared, news)
-    )
+    (
+        stock_model,
+        logistic_model,
+        news_model,
+        metrics,
+        test_output,
+        backtest,
+    ) = train_and_evaluate(prepared, news)
     save_models(
         stock_model,
+        logistic_model,
         news_model,
         metrics,
         backtest,
@@ -640,7 +997,7 @@ def train_command(args: argparse.Namespace) -> int:
 
 
 def predict_command(args: argparse.Namespace) -> int:
-    stock_model, news_model = load_models()
+    stock_model, _, news_model = load_models()
     if args.stock_file:
         prices = read_table(args.stock_file)
     else:

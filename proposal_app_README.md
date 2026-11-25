@@ -24,11 +24,24 @@ Streamlit will open in the default browser.
 
 ## Pages
 
-- **Predict:** live or file-based stock/news prediction.
-- **Portfolio:** covariance, correlation, volatility, and allocations.
+- **Predict:** live or file-based prediction, model selection, and adjustable
+  technical/news weighting.
+- **Portfolio:** select a ticker basket, compare allocation strategies, and
+  view illustrative investment scenarios.
+- **News Review:** label headlines; saved labels override sentiment immediately
+  and are included in future retraining.
 - **Retrain:** explicitly replace the proposal-aligned models.
-- **Model Status:** metrics and training limitations.
-- **About:** project explanation.
+- **Model Status:** model comparisons, ticker stability, and per-ticker
+  transaction-cost backtests.
+- **About:** project explanation and limitations.
+
+The portfolio estimate uses historical returns to show low/base/high scenarios.
+It is not a forecast or guarantee and assumes daily rebalancing at the selected
+allocation.
+
+The Retrain page preserves a downloadable history of successful runs in
+`proposal_pipeline_outputs/proposal_training_history.csv`, including data
+coverage, model metrics, backtest returns, and training duration.
 
 ## Live prediction
 

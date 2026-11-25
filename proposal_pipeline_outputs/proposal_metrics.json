@@ -14,52 +14,69 @@
     "News_Sentiment_Count"
   ],
   "split": "chronological 80/20",
-  "train_rows": 29514,
-  "test_rows": 9036,
-  "final_training_rows": 38550,
-  "accuracy": 0.5153829127932713,
-  "f1": 0.5640617222498756,
-  "ticker_stability": {
-    "AAPL": {
-      "rows": 1506,
-      "accuracy": 0.5245683930942895,
-      "f1": 0.625914315569488
+  "train_rows": 11964,
+  "test_rows": 2994,
+  "final_training_rows": 14958,
+  "accuracy": 0.5207080828323313,
+  "f1": 0.4973730297723292,
+  "model_comparison": {
+    "Majority Class Baseline": {
+      "accuracy": 0.5140280561122245,
+      "f1": 0.6790205162144275
     },
-    "AMZN": {
-      "rows": 1506,
-      "accuracy": 0.5139442231075697,
-      "f1": 0.6242299794661191
+    "Logistic Regression": {
+      "accuracy": 0.5016700066800267,
+      "f1": 0.4185502727981294
     },
-    "GOOGL": {
-      "rows": 1506,
-      "accuracy": 0.5424966799468791,
-      "f1": 0.6352567496029645
-    },
-    "META": {
-      "rows": 1506,
-      "accuracy": 0.49800796812749004,
-      "f1": 0.4009508716323296
-    },
-    "MSFT": {
-      "rows": 1506,
-      "accuracy": 0.5172642762284196,
-      "f1": 0.5044308111792775
-    },
-    "NVDA": {
-      "rows": 1506,
-      "accuracy": 0.4960159362549801,
-      "f1": 0.5150159744408945
+    "Random Forest": {
+      "accuracy": 0.5207080828323313,
+      "f1": 0.4973730297723292
     }
   },
-  "strategy_final_return": 2.802844181341405,
-  "buy_hold_final_return": 3.247006223886312,
+  "ticker_stability": {
+    "AAPL": {
+      "rows": 499,
+      "accuracy": 0.5350701402805611,
+      "f1": 0.5
+    },
+    "AMZN": {
+      "rows": 499,
+      "accuracy": 0.5190380761523046,
+      "f1": 0.5061728395061729
+    },
+    "GOOGL": {
+      "rows": 499,
+      "accuracy": 0.48897795591182364,
+      "f1": 0.4698544698544699
+    },
+    "META": {
+      "rows": 499,
+      "accuracy": 0.5290581162324649,
+      "f1": 0.46952595936794583
+    },
+    "MSFT": {
+      "rows": 499,
+      "accuracy": 0.503006012024048,
+      "f1": 0.5303030303030303
+    },
+    "NVDA": {
+      "rows": 499,
+      "accuracy": 0.5490981963927856,
+      "f1": 0.5033112582781457
+    }
+  },
+  "strategy_final_return": 0.24691020585716705,
+  "logistic_strategy_final_return": 0.12508487304746452,
+  "buy_hold_final_return": 0.35388152359515335,
+  "backtest_transaction_cost_bps": 10,
   "news_model": {
-    "training_rows": 48,
+    "training_rows": 46,
     "training_accuracy": 1.0,
     "label_distribution": {
-      "-1": 2,
-      "0": 41,
+      "-1": 4,
+      "0": 37,
       "1": 5
-    }
+    },
+    "manual_label_rows": 0
   }
 }

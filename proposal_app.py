@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +15,12 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from proposal_pipeline import (  # noqa: E402
+    InputError,
     TICKERS,
+    TRAINING_HISTORY_PATH,
+    append_training_record,
+    apply_manual_news_labels,
+    apply_signal_weights,
     build_portfolio,
     download_live_news,
     download_live_prices,
@@ -21,15 +28,18 @@ from proposal_pipeline import (  # noqa: E402
     predict_with_models,
     prepare_news,
     prepare_prices,
-    read_table,
+    project_investment,
     train_and_evaluate,
     save_models,
+    update_manual_news_labels,
 )
 
 
 OUTPUT_DIR = ROOT / "proposal_pipeline_outputs"
 METRICS_PATH = OUTPUT_DIR / "proposal_metrics.json"
 PORTFOLIO_METRICS_PATH = OUTPUT_DIR / "proposal_portfolio_metrics.json"
+BACKTEST_PATH = OUTPUT_DIR / "proposal_backtest.csv"
+LOGISTIC_MODEL_PATH = OUTPUT_DIR / "proposal_logistic_model.joblib"
 
 st.set_page_config(
     page_title="W Trade",
@@ -426,6 +436,7 @@ with st.sidebar:
     nav_items = [
         "Predict",
         "Portfolio",
+        "News Review",
         "Retrain",
         "Model Status",
         "About",
@@ -464,6 +475,27 @@ with st.sidebar:
         ["1mo", "3mo", "6mo", "1y", "5y", "10y"],
         index=0,
     )
+    selected_tickers = st.multiselect(
+        "Portfolio basket",
+        options=TICKERS,
+        default=TICKERS,
+        help="This basket filters prediction, portfolio, and backtest results.",
+    )
+    model_options = ["Random Forest"]
+    if LOGISTIC_MODEL_PATH.exists():
+        model_options.append("Logistic Regression")
+    selected_model = st.selectbox("Stock prediction model", model_options)
+    if not LOGISTIC_MODEL_PATH.exists():
+        st.caption("Retrain models to enable Logistic Regression.")
+    technical_weight = st.slider(
+        "Technical signal weight",
+        min_value=50,
+        max_value=90,
+        value=70,
+        step=5,
+        format="%d%%",
+        help="The remaining weight is assigned to news sentiment.",
+    ) / 100
 
 if data_source == "Upload files":
     uploaded_prices = data_editor_price_upload("Stock price file")
@@ -481,9 +513,20 @@ if page == "Predict":
         "Use Retrain to update the models."
     )
 
-    if st.button("Run prediction", type="primary"):
+    if not selected_tickers:
+        st.warning("Select at least one ticker in the sidebar basket.")
+    if selected_tickers and st.button("Run prediction", type="primary"):
         try:
-            stock_model, news_model = load_models()
+            rf_model, logistic_model, news_model = load_models()
+            stock_model = (
+                logistic_model
+                if selected_model == "Logistic Regression"
+                else rf_model
+            )
+            if stock_model is None:
+                raise InputError(
+                    "Logistic Regression is not trained yet. Run Retrain first."
+                )
             if uploaded_prices is not None:
                 prices = uploaded_prices
             else:
@@ -499,18 +542,43 @@ if page == "Predict":
                 news_model,
                 prices,
                 news,
+                technical_weight,
             )
             st.session_state["stock_output"] = stock_output
             st.session_state["combined_output"] = combined
+            st.session_state["prediction_model"] = selected_model
+            st.session_state["prediction_tickers"] = tuple(selected_tickers)
 
             if "News_Sentiment" in stock_output.columns:
                 st.success("Prediction complete.")
         except Exception as error:
             st.error(str(error))
 
-    if "stock_output" in st.session_state:
-        stock_output = st.session_state["stock_output"]
-        combined = st.session_state["combined_output"]
+    if selected_tickers and "stock_output" in st.session_state:
+        stored_tickers = st.session_state.get("prediction_tickers", ())
+        if (
+            st.session_state.get("prediction_model") != selected_model
+            or stored_tickers != tuple(selected_tickers)
+        ):
+            st.info(
+                "The displayed results are from the previous model or basket. "
+                "Run prediction again to refresh them."
+            )
+        stock_output = st.session_state["stock_output"].copy()
+        combined = apply_signal_weights(
+            st.session_state["combined_output"],
+            technical_weight,
+        )
+        st.session_state["combined_output"] = combined
+        stock_output = stock_output[
+            stock_output["Ticker"].astype(str).isin(selected_tickers)
+        ].copy()
+        combined = combined[
+            combined["Ticker"].astype(str).isin(selected_tickers)
+        ].copy()
+        if stock_output.empty:
+            st.warning("No predictions are available for the selected basket.")
+            st.stop()
 
         overview = st.columns(4)
         overview[0].metric(
@@ -749,17 +817,130 @@ if page == "Predict":
         )
 
 
+elif page == "News Review":
+    st.subheader("Review and label financial news")
+    st.caption(
+        "Your labels are saved locally, override model sentiment immediately, "
+        "and are used as training labels the next time you retrain."
+    )
+
+    try:
+        raw_news = uploaded_news if uploaded_news is not None else cached_live_news()
+        reviewed = apply_manual_news_labels(prepare_news(raw_news))
+        if selected_tickers:
+            reviewed = reviewed[
+                reviewed["Ticker"].isin(selected_tickers)
+            ]
+        else:
+            st.warning("Select tickers in the sidebar basket to review their news.")
+            st.stop()
+        reviewed = reviewed.drop_duplicates(
+            ["Ticker", "Headline"], keep="last"
+        ).reset_index(drop=True)
+        if reviewed.empty:
+            st.info("No headlines were found for the selected basket.")
+            st.stop()
+        try:
+            _, _, news_model = load_models()
+            predicted_labels = news_model.predict(reviewed["Headline"])
+        except InputError:
+            predicted_labels = reviewed["Weak_Label"].to_numpy()
+            st.info(
+                "No trained news model is available. Current labels use the "
+                "weak lexicon until you retrain."
+            )
+
+        sentiment_names = {-1: "Negative", 0: "Neutral", 1: "Positive"}
+        editor = reviewed[["Ticker", "Headline"]].copy()
+        editor["Model sentiment"] = [
+            sentiment_names[int(label)] for label in predicted_labels
+        ]
+        editor["Your label"] = reviewed["Manual_Label"].map(
+            lambda value: sentiment_names[int(value)]
+            if pd.notna(value) else "Use model"
+        )
+        st.write(f"Headlines to review: {len(editor)}")
+        edited = st.data_editor(
+            editor,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Ticker", "Headline", "Model sentiment"],
+            column_config={
+                "Your label": st.column_config.SelectboxColumn(
+                    "Your label",
+                    options=["Use model", "Positive", "Neutral", "Negative"],
+                    required=True,
+                )
+            },
+            key="news_label_editor",
+        )
+        if st.button("Save news labels", type="primary"):
+            reviewed_labels = edited[["Ticker", "Headline", "Your label"]].copy()
+            reviewed_labels["Label"] = reviewed_labels["Your label"].map({
+                "Negative": -1,
+                "Neutral": 0,
+                "Positive": 1,
+            })
+            update_manual_news_labels(
+                reviewed_labels[["Ticker", "Headline", "Label"]]
+            )
+            st.success("News labels saved and will be used immediately.")
+            st.rerun()
+    except Exception as error:
+        st.error(str(error))
+
+
 elif page == "Portfolio":
     st.subheader("Portfolio risk and diversification")
-
     portfolio_period = st.selectbox(
         "Portfolio return history",
         ["3mo", "6mo", "1y", "5y", "10y"],
-        index=2,
+        index=3,
         key="portfolio_period",
     )
+    investment_amount = st.number_input(
+        "Investment amount (USD)",
+        min_value=100.0,
+        max_value=100_000_000.0,
+        value=10_000.0,
+        step=1_000.0,
+    )
+    projection_years = st.slider(
+        "Projection horizon (years)",
+        min_value=1,
+        max_value=30,
+        value=5,
+    )
+    allocation_strategy = st.selectbox(
+        "Allocation used for investment estimate",
+        [
+            "Markowitz minimum variance",
+            "Inverse volatility",
+            "Signal-adjusted",
+            "Equal weight",
+        ],
+    )
+    allocation_columns = {
+        "Markowitz minimum variance": "Markowitz_Weight",
+        "Inverse volatility": "Inverse_Volatility_Weight",
+        "Signal-adjusted": "Optimized_Weight",
+        "Equal weight": "Equal_Weight",
+    }
 
-    if st.button("Run portfolio analysis", type="primary"):
+    uploaded_price = st.session_state.get("Stock price file")
+    uploaded_price_name = getattr(uploaded_price, "name", "")
+    portfolio_signature = (
+        tuple(selected_tickers),
+        portfolio_period,
+        data_source,
+        uploaded_price_name,
+    )
+
+    if len(selected_tickers) < 2:
+        st.warning("Select at least two tickers in the sidebar basket.")
+    if len(selected_tickers) >= 2 and st.button(
+        "Run portfolio analysis", type="primary"
+    ):
         try:
             if uploaded_prices is not None:
                 prices = uploaded_prices
@@ -767,118 +948,186 @@ elif page == "Portfolio":
                 prices = cached_live_prices(portfolio_period)
 
             combined = st.session_state.get("combined_output")
+            if combined is not None:
+                combined = apply_signal_weights(combined, technical_weight)
+                combined = combined[
+                    combined["Ticker"].isin(selected_tickers)
+                ]
             weights, covariance, correlation, metrics = build_portfolio(
                 prices,
                 combined,
+                selected_tickers,
             )
             st.session_state["weights"] = weights
             st.session_state["covariance"] = covariance
             st.session_state["correlation"] = correlation
             st.session_state["portfolio_metrics"] = metrics
+            st.session_state["portfolio_prices"] = prices
+            st.session_state["portfolio_signature"] = portfolio_signature
             st.success("Portfolio analysis complete.")
         except Exception as error:
             st.error(str(error))
 
     if "weights" in st.session_state:
-        weights = st.session_state["weights"]
-        covariance = st.session_state["covariance"]
-        correlation = st.session_state["correlation"]
-        metrics = st.session_state["portfolio_metrics"]
+        if st.session_state.get("portfolio_signature") != portfolio_signature:
+            st.info("The basket or data source changed. Run portfolio analysis again.")
+        else:
+            weights = st.session_state["weights"].copy()
+            covariance = st.session_state["covariance"]
+            correlation = st.session_state["correlation"]
+            metrics = st.session_state["portfolio_metrics"]
 
-        columns = st.columns(3)
-        columns[0].metric(
-            "Equal-weight volatility",
-            f"{metrics['equal_weight_annualized_volatility']:.2%}",
-        )
-        columns[1].metric(
-            "Inverse-volatility volatility",
-            f"{metrics['inverse_volatility_annualized_volatility']:.2%}",
-        )
-        columns[2].metric(
-            "Estimated risk reduction",
-            f"{metrics['risk_reduction_percent']:.2f}%",
-        )
-
-        weight_display = weights.copy()
-        for column in [
-            "Equal_Weight",
-            "Inverse_Volatility_Weight",
-            "Optimized_Weight",
-        ]:
-            weight_display[column] = (
-                weight_display[column] * 100
-            ).round(2).astype(str) + "%"
-
-        st.markdown("### Suggested allocations")
-        st.dataframe(
-            weight_display,
-            use_container_width=True,
-            hide_index=True,
-        )
-        download_csv(weights, "proposal_portfolio_weights.csv")
-
-        covariance_values = covariance.set_index("Ticker")
-        correlation_values = correlation.set_index("Ticker")
-
-        st.markdown("### Covariance")
-        st.dataframe(covariance_values, use_container_width=True)
-
-        st.markdown("### Correlation")
-        st.dataframe(
-            correlation_values.style.background_gradient(cmap="RdYlGn", axis=None),
-            use_container_width=True,
-        )
-
-        st.markdown("### Optimized allocation")
-        allocation_chart = weights.set_index("Ticker")[
-            "Optimized_Weight"
-        ]
-        allocation_frame = allocation_chart.reset_index()
-        allocation_frame.columns = ["Ticker", "Optimized_Weight"]
-        allocation_frame = allocation_frame.sort_values("Optimized_Weight")
-        allocation_frame["Weight_%"] = (
-            allocation_frame["Optimized_Weight"] * 100
-        ).round(2)
-        allocation_colors = [
-            "#48E0C2" if action == "Increase" else "#FF5E95"
-            for action in weights.set_index("Ticker").loc[
-                allocation_frame["Ticker"], "Diversification_Action"
-            ]
-        ]
-        allocation_figure = go.Figure(
-            go.Bar(
-                x=allocation_frame["Weight_%"],
-                y=allocation_frame["Ticker"],
-                orientation="h",
-                marker={
-                    "color": allocation_colors,
-                    "line": {"color": "rgba(240,248,255,.42)", "width": 1},
-                    "cornerradius": 5,
-                },
-                text=[f"{weight:.2f}% " for weight in allocation_frame["Weight_%"]],
-                textposition="outside",
-                customdata=allocation_frame["Optimized_Weight"],
-                hovertemplate="<b>%{y}</b><br>Weight: %{customdata:.2%}<extra></extra>",
+            columns = st.columns(4)
+            columns[0].metric(
+                "Equal-weight volatility",
+                f"{metrics['equal_weight_annualized_volatility']:.2%}",
             )
-        )
-        allocation_figure.update_layout(
-            template="plotly_dark",
-            height=max(260, 70 + 44 * len(allocation_frame)),
-            margin={"l": 20, "r": 90, "t": 10, "b": 25},
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(8,17,31,.45)",
-            bargap=0.42,
-            showlegend=False,
-            xaxis={
-                "title": "Optimized portfolio weight",
-                "ticksuffix": "%",
-                "range": [0, max(5, allocation_frame["Weight_%"].max() * 1.18)],
-                "gridcolor": "rgba(132,173,213,.15)",
-            },
-            yaxis={"gridcolor": "rgba(132,173,213,.08)", "tickfont": {"size": 13}},
-            font={"color": "#EDF4FF"},
-        )
-        st.plotly_chart(allocation_figure, use_container_width=True)
+            columns[1].metric(
+                "Inverse-volatility volatility",
+                f"{metrics['inverse_volatility_annualized_volatility']:.2%}",
+            )
+            columns[2].metric(
+                "Markowitz volatility",
+                f"{metrics['markowitz_annualized_volatility']:.2%}",
+            )
+            columns[3].metric(
+                "Markowitz risk reduction",
+                f"{metrics['markowitz_risk_reduction_percent']:.2f}%",
+            )
+
+            st.markdown("### Basket allocation strategies")
+            weight_figure = go.Figure()
+            for column, label in [
+                ("Equal_Weight", "Equal weight"),
+                ("Inverse_Volatility_Weight", "Inverse volatility"),
+                ("Markowitz_Weight", "Markowitz minimum variance"),
+                ("Optimized_Weight", "Signal-adjusted"),
+            ]:
+                weight_figure.add_bar(
+                    x=weights["Ticker"],
+                    y=weights[column],
+                    name=label,
+                )
+            weight_figure.update_layout(
+                template="plotly_dark",
+                barmode="group",
+                yaxis={"title": "Portfolio weight", "tickformat": ".0%"},
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(8,17,31,.45)",
+                font={"color": "#EDF4FF"},
+            )
+            st.plotly_chart(weight_figure, use_container_width=True)
+
+            selected_weight_column = allocation_columns[allocation_strategy]
+            weights["Investment_Amount"] = (
+                weights[selected_weight_column] * investment_amount
+            )
+            st.markdown("### Selected basket and dollar allocations")
+            st.dataframe(
+                weights[
+                    [
+                        "Ticker",
+                        "Annualized_Volatility",
+                        "Equal_Weight",
+                        "Inverse_Volatility_Weight",
+                        "Markowitz_Weight",
+                        "Optimized_Weight",
+                        "Investment_Amount",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Annualized_Volatility": st.column_config.NumberColumn(
+                        "Annualized volatility", format="%.2%%"
+                    ),
+                    "Equal_Weight": st.column_config.NumberColumn(
+                        "Equal weight", format="%.2%%"
+                    ),
+                    "Inverse_Volatility_Weight": st.column_config.NumberColumn(
+                        "Inverse-volatility weight", format="%.2%%"
+                    ),
+                    "Markowitz_Weight": st.column_config.NumberColumn(
+                        "Markowitz weight", format="%.2%%"
+                    ),
+                    "Optimized_Weight": st.column_config.NumberColumn(
+                        "Signal-adjusted weight", format="%.2%%"
+                    ),
+                    "Investment_Amount": st.column_config.NumberColumn(
+                        "Suggested investment", format="$%.2f"
+                    ),
+                },
+            )
+            download_csv(weights, "proposal_portfolio_weights.csv")
+
+            st.markdown("### Historical investment scenarios")
+            try:
+                projection = project_investment(
+                    st.session_state["portfolio_prices"],
+                    weights.set_index("Ticker")[selected_weight_column],
+                    investment_amount,
+                    projection_years,
+                )
+                st.caption(
+                    f"Illustrative {projection_years}-year estimate using "
+                    f"{portfolio_period} of the basket's historical daily returns. "
+                    "Scenarios are the 5th, "
+                    "50th, and 95th percentiles under a log-return assumption; "
+                    "weights are assumed to be rebalanced daily. Not a forecast "
+                    "or guarantee."
+                )
+                projection_columns = st.columns(3)
+                projection_columns[0].metric(
+                    "Low scenario (5th percentile)",
+                    f"${projection['low']:,.2f}",
+                )
+                projection_columns[1].metric(
+                    "Base scenario (median)",
+                    f"${projection['base']:,.2f}",
+                )
+                projection_columns[2].metric(
+                    "High scenario (95th percentile)",
+                    f"${projection['high']:,.2f}",
+                )
+                projection_figure = go.Figure()
+                projection_figure.add_bar(
+                    x=["Initial investment", "Low", "Base", "High"],
+                    y=[
+                        investment_amount,
+                        projection["low"],
+                        projection["base"],
+                        projection["high"],
+                    ],
+                    marker_color=["#91A4BD", "#FF5E95", "#48E0C2", "#49A3FF"],
+                )
+                projection_figure.update_layout(
+                    template="plotly_dark",
+                    yaxis={"title": "Illustrative value (USD)", "tickprefix": "$"},
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(8,17,31,.45)",
+                    font={"color": "#EDF4FF"},
+                )
+                st.plotly_chart(projection_figure, use_container_width=True)
+                st.write(
+                    f"Historical annualized return: "
+                    f"{projection['annualized_return']:.2%} · "
+                    f"annualized volatility: "
+                    f"{projection['annualized_volatility']:.2%}"
+                )
+            except InputError as error:
+                st.warning(str(error))
+
+            covariance_values = covariance.set_index("Ticker")
+            correlation_values = correlation.set_index("Ticker")
+            st.markdown("### Covariance")
+            st.dataframe(covariance_values, use_container_width=True)
+            st.markdown("### Correlation")
+            st.dataframe(
+                correlation_values.style.background_gradient(
+                    cmap="RdYlGn", axis=None
+                ),
+                use_container_width=True,
+            )
 
 
 elif page == "Retrain":
@@ -887,6 +1136,45 @@ elif page == "Retrain":
         "Retraining replaces the stored proposal stock and news models. "
         "It should be run explicitly rather than on every prediction."
     )
+
+    training_history = (
+        pd.read_csv(TRAINING_HISTORY_PATH)
+        if TRAINING_HISTORY_PATH.exists()
+        else pd.DataFrame()
+    )
+    if not training_history.empty:
+        latest = training_history.sort_values("Trained_At_UTC").iloc[-1]
+        st.markdown("### Last successful training")
+        st.caption(
+            f"Completed {latest['Trained_At_UTC']} · "
+            f"{latest['Price_Source']} · {latest['Price_History_Period']} · "
+            f"price dates {latest['Price_Date_From']} to "
+            f"{latest['Price_Date_To']}"
+        )
+        latest_columns = st.columns(4)
+        latest_columns[0].metric(
+            "Training rows",
+            f"{int(latest['Training_Rows']):,}",
+        )
+        latest_columns[1].metric(
+            "Random Forest F1",
+            f"{latest['RF_F1']:.2%}",
+        )
+        latest_columns[2].metric(
+            "Logistic Regression F1",
+            f"{latest['LR_F1']:.2%}",
+        )
+        latest_columns[3].metric(
+            "Human-labeled headlines",
+            f"{int(latest['Human_Labeled_News_Rows']):,}",
+        )
+        st.caption(f"News source: {latest['News_Source']}")
+    else:
+        st.info(
+            "No retraining history is available yet. The first successful run "
+            "after this feature is added will appear here; older runs cannot "
+            "be reconstructed because their data source and period were not saved."
+        )
 
     retrain_period = st.selectbox(
         "Retraining stock history",
@@ -897,6 +1185,19 @@ elif page == "Retrain":
 
     if st.button("Retrain models", type="primary"):
         try:
+            training_started = time.perf_counter()
+            price_upload = st.session_state.get("Stock price file")
+            news_upload = st.session_state.get("News headline file")
+            price_source = (
+                f"Uploaded file: {getattr(price_upload, 'name', 'stock data')}"
+                if uploaded_prices is not None
+                else "Yahoo Finance"
+            )
+            news_source = (
+                f"Uploaded file: {getattr(news_upload, 'name', 'news data')}"
+                if uploaded_news is not None
+                else "Yahoo Finance"
+            )
             if uploaded_prices is not None:
                 prices = uploaded_prices
             else:
@@ -908,17 +1209,67 @@ elif page == "Retrain":
                 news = prepare_news(cached_live_news())
 
             prepared = prepare_prices(prices)
-            stock_model, news_model, metrics, test_output, backtest = (
-                train_and_evaluate(prepared, news)
-            )
+            (
+                stock_model,
+                logistic_model,
+                news_model,
+                metrics,
+                test_output,
+                backtest,
+            ) = train_and_evaluate(prepared, news)
             save_models(
                 stock_model,
+                logistic_model,
                 news_model,
                 metrics,
                 backtest,
                 test_output,
             )
-            st.success("Models retrained and saved.")
+            model_comparison = metrics["model_comparison"]
+            training_record = {
+                "Trained_At_UTC": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                "Price_Source": price_source,
+                "News_Source": news_source,
+                "Price_History_Period": (
+                    "Uploaded file" if uploaded_prices is not None else retrain_period
+                ),
+                "Price_Rows": int(len(prepared)),
+                "Training_Rows": int(metrics["train_rows"]),
+                "Test_Rows": int(metrics["test_rows"]),
+                "Split_Method": metrics["split"],
+                "Stock_Features": ", ".join(metrics["stock_features"]),
+                "Price_Date_From": prepared["Date"].min().date().isoformat(),
+                "Price_Date_To": prepared["Date"].max().date().isoformat(),
+                "Tickers": ", ".join(sorted(prepared["Ticker"].unique())),
+                "News_Training_Rows": int(
+                    metrics["news_model"]["training_rows"]
+                ),
+                "Human_Labeled_News_Rows": int(
+                    metrics["news_model"].get("manual_label_rows", 0)
+                ),
+                "RF_Accuracy": model_comparison["Random Forest"]["accuracy"],
+                "RF_F1": model_comparison["Random Forest"]["f1"],
+                "LR_Accuracy": model_comparison["Logistic Regression"]["accuracy"],
+                "LR_F1": model_comparison["Logistic Regression"]["f1"],
+                "RF_Strategy_Return": metrics["strategy_final_return"],
+                "LR_Strategy_Return": metrics["logistic_strategy_final_return"],
+                "Buy_Hold_Return": metrics["buy_hold_final_return"],
+                "Transaction_Cost_Bps": metrics["backtest_transaction_cost_bps"],
+                "Training_Seconds": round(
+                    time.perf_counter() - training_started, 2
+                ),
+            }
+            try:
+                append_training_record(training_record)
+            except Exception as history_error:
+                st.error(
+                    "Models were retrained and saved, but the training-history "
+                    f"record could not be written: {history_error}"
+                )
+            else:
+                st.success("Models retrained, saved, and recorded.")
             st.metric("Stock accuracy", f"{metrics['accuracy']:.2%}")
             st.metric("Stock F1", f"{metrics['f1']:.2%}")
             st.metric(
@@ -929,9 +1280,87 @@ elif page == "Retrain":
                 "Buy-and-Hold cumulative return",
                 f"{metrics['buy_hold_final_return']:.2%}",
             )
+            st.markdown("### Out-of-sample model comparison")
+            st.dataframe(
+                pd.DataFrame.from_dict(
+                    metrics["model_comparison"],
+                    orient="index",
+                ).rename(columns={
+                    "accuracy": "Accuracy",
+                    "f1": "F1",
+                }),
+                use_container_width=True,
+            )
             st.json(metrics)
         except Exception as error:
             st.error(str(error))
+
+    if TRAINING_HISTORY_PATH.exists():
+        training_history = pd.read_csv(TRAINING_HISTORY_PATH)
+    if not training_history.empty:
+        st.markdown("### Training history")
+        history_columns = [
+            "Trained_At_UTC",
+            "Price_Source",
+            "News_Source",
+            "Price_History_Period",
+            "Price_Date_From",
+            "Price_Date_To",
+            "Tickers",
+            "Price_Rows",
+            "Training_Rows",
+            "Test_Rows",
+            "Split_Method",
+            "Stock_Features",
+            "News_Training_Rows",
+            "Human_Labeled_News_Rows",
+            "RF_Accuracy",
+            "RF_F1",
+            "LR_Accuracy",
+            "LR_F1",
+            "RF_Strategy_Return",
+            "LR_Strategy_Return",
+            "Buy_Hold_Return",
+            "Transaction_Cost_Bps",
+            "Training_Seconds",
+        ]
+        recent_history = (
+            training_history.sort_values("Trained_At_UTC", ascending=False)
+            .head(20)
+        )
+        st.dataframe(
+            recent_history[history_columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "RF_Accuracy": st.column_config.NumberColumn(
+                    "RF accuracy", format="%.2%%"
+                ),
+                "RF_F1": st.column_config.NumberColumn("RF F1", format="%.2%%"),
+                "LR_Accuracy": st.column_config.NumberColumn(
+                    "LR accuracy", format="%.2%%"
+                ),
+                "LR_F1": st.column_config.NumberColumn("LR F1", format="%.2%%"),
+                "RF_Strategy_Return": st.column_config.NumberColumn(
+                    "RF backtest return", format="%.2%%"
+                ),
+                "LR_Strategy_Return": st.column_config.NumberColumn(
+                    "LR backtest return", format="%.2%%"
+                ),
+                "Buy_Hold_Return": st.column_config.NumberColumn(
+                    "Buy-and-hold return", format="%.2%%"
+                ),
+                "Training_Seconds": st.column_config.NumberColumn(
+                    "Training time (seconds)", format="%.2f"
+                ),
+            },
+        )
+        st.download_button(
+            "Download full training history",
+            data=training_history.to_csv(index=False).encode("utf-8"),
+            file_name="proposal_training_history.csv",
+            mime="text/csv",
+        )
 
 
 elif page == "Model Status":
@@ -955,6 +1384,20 @@ elif page == "Model Status":
         st.write(
             f"**Features:** {', '.join(metrics.get('stock_features', []))}"
         )
+
+        model_comparison = metrics.get("model_comparison", {})
+        if model_comparison:
+            st.markdown("### Out-of-sample model comparison")
+            st.dataframe(
+                pd.DataFrame.from_dict(
+                    model_comparison,
+                    orient="index",
+                ).rename(columns={
+                    "accuracy": "Accuracy",
+                    "f1": "F1",
+                }),
+                use_container_width=True,
+            )
 
         st.markdown("### Ticker stability")
         stability = metrics.get("ticker_stability", {})
@@ -984,6 +1427,65 @@ elif page == "Model Status":
             f"{metrics.get('buy_hold_final_return', 0):.2%}"
         )
 
+    if BACKTEST_PATH.exists():
+        backtest = pd.read_csv(BACKTEST_PATH)
+        required_curve_columns = {
+            "Ticker",
+            "Date",
+            "BuyHold_Cumulative_Value",
+            "Random_Forest_Cumulative_Value",
+            "Logistic_Regression_Cumulative_Value",
+        }
+        if required_curve_columns.issubset(backtest.columns):
+            backtest["Date"] = pd.to_datetime(backtest["Date"])
+            available_backtest_tickers = [
+                ticker for ticker in selected_tickers
+                if ticker in set(backtest["Ticker"].astype(str))
+            ]
+            if available_backtest_tickers:
+                st.markdown("### Per-stock backtest (10 bps transaction cost)")
+                backtest_ticker = st.selectbox(
+                    "Backtest ticker",
+                    available_backtest_tickers,
+                )
+                backtest_model = st.selectbox(
+                    "Backtest model",
+                    ["Random Forest", "Logistic Regression"],
+                )
+                model_curve = (
+                    "Logistic_Regression_Cumulative_Value"
+                    if backtest_model == "Logistic Regression"
+                    else "Random_Forest_Cumulative_Value"
+                )
+                curve_data = backtest[
+                    backtest["Ticker"].astype(str) == backtest_ticker
+                ].sort_values("Date")
+                curve_figure = go.Figure()
+                curve_figure.add_scatter(
+                    x=curve_data["Date"],
+                    y=curve_data["BuyHold_Cumulative_Value"],
+                    mode="lines",
+                    name="Buy and hold",
+                    line={"color": "#91A4BD"},
+                )
+                curve_figure.add_scatter(
+                    x=curve_data["Date"],
+                    y=curve_data[model_curve],
+                    mode="lines",
+                    name=f"{backtest_model} after costs",
+                    line={"color": "#48E0C2"},
+                )
+                curve_figure.update_layout(
+                    template="plotly_dark",
+                    yaxis={"title": "Growth of $1"},
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(8,17,31,.45)",
+                    font={"color": "#EDF4FF"},
+                )
+                st.plotly_chart(curve_figure, use_container_width=True)
+        else:
+            st.info("Retrain to generate the per-ticker, cost-adjusted backtest.")
+
     if portfolio_metrics:
         st.markdown("### Latest portfolio metrics")
         st.json(portfolio_metrics)
@@ -995,15 +1497,17 @@ else:
         """
         This project combines three proposed modules:
 
-        1. **Stock Trend Predictor** - Random Forest with technical features,
-           including RSI and MACD.
+        1. **Stock Trend Predictor** - Random Forest or Logistic Regression
+           with technical features, including RSI and MACD.
         2. **News Sentiment Signal** - TF-IDF and Logistic Regression.
-           News sentiment is merged into the stock feature data.
-        3. **Portfolio Risk Analyzer** - covariance, correlation,
-           inverse-volatility weights, and signal-adjusted allocations.
+           Saved human labels override model sentiment and are included on retraining.
+        3. **Portfolio Risk Analyzer** - selectable stock baskets, covariance,
+           correlation, Markowitz minimum-variance, inverse-volatility, and
+           signal-adjusted allocations.
 
         The UI does not implement a trading system. It does not place trades,
-        guarantee returns, or provide regulated financial advice.
+        guarantee returns, or provide regulated financial advice. Investment
+        scenarios are illustrative historical estimates, not predictions.
 
         News labels may be weakly generated where verified labels are absent.
         Stock accuracy near 50% is close to random direction prediction.

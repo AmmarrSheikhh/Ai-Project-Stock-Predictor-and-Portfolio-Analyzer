@@ -4,7 +4,10 @@ __pycache__/
 venv/
 env/
 .env
+.streamlit/secrets.toml
+proposal_pipeline_outputs_backup/
 .pytest_cache/
+.ruff_cache/
 .mypy_cache/
 .DS_Store
 Thumbs.db

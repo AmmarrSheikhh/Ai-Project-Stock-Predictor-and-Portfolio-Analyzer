@@ -1,0 +1,10 @@
+{
+  "default_tickers": [
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA"
+  ]
+}

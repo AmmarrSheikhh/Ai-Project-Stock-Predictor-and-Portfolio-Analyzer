@@ -1,192 +1,140 @@
 # W Trade
 
-W Trade is a university project that combines stock-direction prediction,
-news sentiment analysis, backtesting, and portfolio-risk analysis in an
-interactive Streamlit dashboard.
-
-The project is an educational prototype. It does not execute trades and should
-not be used as investment advice.
+W Trade is an educational Streamlit prototype for stock-direction modeling,
+financial-news sentiment, strategy backtesting, and portfolio-risk analysis.
+It does not execute trades and is not investment advice.
 
 ## Features
 
-- Random Forest or Logistic Regression stock direction prediction
-- RSI-14 and MACD technical indicators
-- TF-IDF and Logistic Regression news sentiment
-- News sentiment merged into stock model features
-- Adjustable technical/news signal weighting
-- Chronological 80/20 stock evaluation
-- Majority-baseline and classifier model comparison
-- Per-ticker Buy-and-Hold versus cost-adjusted strategy backtesting
-- Ticker-level accuracy and F1 stability
-- User-selected stock baskets
-- Covariance-based Markowitz minimum-variance optimization
-- Equal-weight, inverse-volatility, Markowitz, and signal-adjusted allocation comparison
-- Signal-adjusted portfolio allocations
-- Historical low/base/high investment scenarios
-- Persistent human news labels that override sentiment immediately and are
-  included in future model retraining
-- Live Yahoo Finance or uploaded-file inputs
-- Saved model retraining and prediction
-- Cyberpunk neon Streamlit interface
+- Live Yahoo Finance data or user-uploaded stock and news files
+- Completed-session daily prices, normalized to exchange dates
+- RSI, MACD, scale-free technical features, and configurable ticker universe
+- Financial news sentiment with separate no-news handling and manual labels
+- Random Forest and Logistic Regression model evaluation
+- Chronological, purged validation and probability calibration for newly
+  trained stock models
+- Majority-class, balanced-accuracy, confusion-matrix, and backtest reporting
+- Portfolio allocation comparisons and risk summaries
+- Explicit, password-protected Streamlit retraining
+- Read-only diagnostic script for the currently saved model artifacts
 
-## Run locally
+The current saved models have **not** been retrained by these changes. Their
+stored metrics still describe the legacy model, and those artifacts are
+preserved until a retrain is explicitly confirmed.
 
-### 1. Install Python dependencies
+## Requirements and installation
+
+The pinned dependencies were verified with Python 3.12.8 on Windows.
 
 ```powershell
-python -m pip install -r requirements.txt
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install --upgrade pip
+.\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-### 2. Start the application
+For app-only use, install `requirements.txt` instead of
+`requirements-dev.txt`.
+
+## Run the application
 
 ```powershell
-streamlit run proposal_app.py
+.\venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-Open the local URL shown by Streamlit, usually
-`http://localhost:8501`.
+The original entry point remains available:
 
-## Application pages
-
-### Predict
-
-Choose either live Yahoo Finance data or uploaded files, then run prediction.
-
-The predictions use the saved models. The page supports:
-
-- Viewing all available stocks
-- Searching for a specific ticker
-- Selecting one stock for a focused view
-- Choosing Random Forest or Logistic Regression after retraining
-- Adjusting the technical-versus-news signal blend
-- Stock probability and combined-signal charts
-- Downloadable prediction CSV files
-
-### Portfolio
-
-Choose a basket of supported tickers and calculate:
-
-- Annualized covariance
-- Correlation
-- Equal-weight portfolio volatility
-- Inverse-volatility portfolio volatility
-- Markowitz minimum-variance allocations
-- Signal-adjusted allocation suggestions
-- Dollar allocations for a user-entered investment amount
-- Historical low/base/high value scenarios over a selectable horizon
-
-The scenarios use historical basket returns and are illustrative, not forecasts
-or guarantees. They assume daily rebalancing at the selected allocation.
-
-### News Review
-
-Review current Yahoo headlines or uploaded news and label each headline as
-positive, neutral, negative, or use the model's sentiment. Saved labels are
-stored in `proposal_pipeline_outputs/proposal_news_labels.csv`, override
-sentiment in subsequent predictions, and are included when the models are
-retrained.
-
-### Model Status
-
-Displays stored model metrics, ticker stability, model comparisons, and
-selectable per-ticker backtest curves. Strategy curves include 10 basis points
-of transaction cost per position change.
-
-### Retrain
-
-Retrains and replaces the proposal-aligned stock and news models.
-
-Retraining is intentional and should not run automatically on every prediction.
-Each successful run is recorded in
-`proposal_pipeline_outputs/proposal_training_history.csv` with its timestamp,
-data sources and date coverage, row counts, model scores, backtest returns, and
-training duration. The page shows the latest run and recent history and lets
-you download the full log.
-
-### Model Status
-
-Displays stored model metrics, ticker stability, model comparisons, per-ticker
-backtest curves, and project limitations.
-
-## Upload file formats
-
-### Stock file
-
-Use CSV, XLS, or XLSX containing:
-
-- `Date`
-- `Ticker`
-- `Open`
-- `High`
-- `Low`
-- `Close`
-- `Volume`
-
-CSV-disguised `.xls` files are supported.
-
-### News file
-
-Use CSV, XLS, or XLSX containing:
-
-- `Ticker`
-- `Headline`
-
-Optional columns:
-
-- `PublishedAt`
-- `Sentiment` with values `-1`, `0`, or `1`
-- `Label` with values `negative`, `neutral`, or `positive`
-
-## Requirements
-
-- Python 3.10 or newer
-- Internet access for Yahoo Finance live data
-- Streamlit
-- Plotly
-- Matplotlib
-- pandas
-- NumPy
-- scikit-learn
-- SciPy
-- yfinance
-- joblib
-- openpyxl
-- xlrd
-
-## Deployment
-
-The recommended free deployment target is Streamlit Community Cloud.
-
-1. Push this repository to GitHub.
-2. Open Streamlit Community Cloud.
-3. Create a new app.
-4. Select this repository and the main branch.
-5. Set the entry point to `proposal_app.py`.
-6. Deploy.
-
-## Important limitations
-
-- Stock performance is close to chance and is not reliable enough for real
-  investment decisions.
-- The bundled news corpus is small.
-- News weak labels can be incorrect.
-- Yahoo Finance availability and rate limits can affect live downloads.
-- Retraining may need a network connection.
-- Backtests include 10 bps per position change, but do not model taxes,
-  slippage, liquidity, or live trading.
-
-## Repository file guide
-
-### Required app files
-
-```text
-proposal_app.py
-proposal_pipeline.py
-requirements.txt
-.streamlit/config.toml
-proposal_pipeline_outputs/
-stock_prices_cleaned.xls
-stock_news_cleaned.xls
+```powershell
+.\venv\Scripts\python.exe -m streamlit run proposal_app.py
 ```
 
-Do not upload virtual-environment folders or local caches.
+Both entry points use the same app. The established page structure is Predict,
+Portfolio, Retrain, Model Status, News Review, and About. The ticker defaults
+are in `ticker_universe.json`; the UI also allows selecting a custom basket.
+
+### Predict and data handling
+
+- Live downloads request a longer history than the selected chart period to
+  allow indicators to warm up. Prediction requires at least 60 usable rows
+  after feature processing; tickers below this threshold are skipped with a
+  per-ticker explanation.
+- A current US daily bar is omitted until the New York market has closed at
+  16:00. Displayed price dates are calendar dates, and results show their
+  `Data as of` date.
+- The default prediction period is six months. Short periods that cannot meet
+  the minimum-history requirement are not offered as prediction periods.
+- News is aggregated over the configured recent window. Neutral headlines are
+  a numeric zero sentiment; no matching recent headlines are represented
+  separately and cause a stock-only prediction.
+- Results show the stock-model probability, news adjustment, combined
+  probability, and headline count as separate values.
+- Yahoo errors, including rate limiting, are surfaced in the app. Live Yahoo
+  requests require internet access; uploaded-file prediction works without
+  Yahoo data.
+
+### Upload formats
+
+Stock CSV, XLS, or XLSX files require `Date`, `Ticker`, `Open`, `High`, `Low`,
+`Close`, and `Volume` columns.
+
+News CSV, XLS, or XLSX files require `Ticker` and `Headline`. `PublishedAt`,
+`Sentiment` (`-1`, `0`, or `1`), and `Label` (`negative`, `neutral`, or
+`positive`) are optional.
+
+## Diagnostics and tests
+
+The diagnostic reads the existing held-out predictions and saved models; it
+does not retrain or overwrite model files.
+
+```powershell
+.\venv\Scripts\python.exe .\diagnose_model.py
+.\venv\Scripts\python.exe -m pytest -q
+.\venv\Scripts\python.exe -m ruff check .
+```
+
+## Retraining safeguards
+
+Prediction never retrains models automatically. Retraining replaces the saved
+model bundle, so back up the project or its model outputs before proceeding.
+The CLI requires `--confirm-retrain` and an interactive `RETRAIN` confirmation.
+The Streamlit Retrain page requires an explicit checkbox and a password read
+from `.streamlit/secrets.toml`; create that local file using
+`.streamlit/secrets.toml.example` as a template. Never commit the real secrets
+file or share its password.
+
+The CLI training command is:
+
+```powershell
+.\venv\Scripts\python.exe .\proposal_pipeline.py train --stock-file .\stock_prices_cleaned.xls --news-file .\stock_news_cleaned.xls --confirm-retrain
+```
+
+The command prompts for `RETRAIN` before training. Successful retraining backs
+up the previous output bundle under `proposal_pipeline_outputs_backup\`.
+Tests train only in memory or temporary directories.
+
+## Model and evaluation notes
+
+- The direction target uses a future close/return relative to the current
+  completed session; features are computed from current and prior data. New
+  model validation is chronological and purges overlapping target horizons.
+- Class-weight balancing and sigmoid calibration apply only when the user
+  explicitly retrains. The diagnostic and Model Status metrics continue to
+  describe the currently saved artifact until then.
+- Strategies include a five-basis-point transaction cost per position change.
+  Backtest and portfolio estimates are historical illustrations, not forecasts.
+- The bundled news data is small and may not align with current market dates.
+  The live prediction window can therefore contain no news for a ticker.
+- Yahoo availability and rate limits can affect live data retrieval. The
+  prototype does not model taxes, liquidity, slippage, or execution.
+
+## Project layout
+
+- `app.py`: Streamlit page orchestration
+- `proposal_app.py`: backward-compatible Streamlit entry point
+- `data/pipeline.py`: data preparation, features, modeling, evaluation,
+  prediction, portfolio analysis, and guarded persistence
+- `proposal_pipeline.py`: backward-compatible pipeline module and CLI entry
+- `data/universe.py`, `ticker_universe.json`: ticker configuration
+- `pages/`, `ui/`: page helpers and accessibility/theme behavior
+- `diagnose_model.py`: read-only saved-model diagnostics
+- `tests/`: focused pipeline and app tests
+- `proposal_pipeline_outputs/`: persisted models and metrics

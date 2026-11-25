@@ -1,3 +1,5 @@
+"""Portfolio display helpers rendered within the main W Trade app."""
+
 def render_risk_summary(streamlit, metrics: dict) -> None:
     columns = streamlit.columns(5)
     columns[0].metric(

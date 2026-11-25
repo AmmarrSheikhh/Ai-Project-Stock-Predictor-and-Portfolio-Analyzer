@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pandas as pd
 
 from data.pipeline import InputError
-from pages.news_review import render
+from ui.page_components.news_review import render
 
 
 def test_news_review_renders_uploaded_news_without_fetching_live_data():

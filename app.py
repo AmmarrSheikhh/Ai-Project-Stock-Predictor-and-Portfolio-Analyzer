@@ -40,9 +40,9 @@ from data.pipeline import (  # noqa: E402
     train_and_evaluate,
     update_manual_news_labels,
 )
-from pages.about import render as render_about  # noqa: E402
-from pages.news_review import render as render_news_review  # noqa: E402
-from pages.portfolio import render_risk_summary  # noqa: E402
+from ui.page_components.about import render as render_about  # noqa: E402
+from ui.page_components.news_review import render as render_news_review  # noqa: E402
+from ui.page_components.portfolio import render_risk_summary  # noqa: E402
 from ui.theme import inject_accessibility_styles  # noqa: E402
 
 OUTPUT_DIR = ROOT / "proposal_pipeline_outputs"

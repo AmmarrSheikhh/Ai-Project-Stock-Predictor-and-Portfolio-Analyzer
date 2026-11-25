@@ -1,3 +1,5 @@
+"""About-page content rendered within the main W Trade app."""
+
 def render(streamlit) -> None:
     streamlit.subheader("About this project")
     streamlit.markdown(

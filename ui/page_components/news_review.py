@@ -1,3 +1,5 @@
+"""News-review content rendered within the main W Trade app."""
+
 def render(
     streamlit,
     pandas,

@@ -134,7 +134,7 @@ Tests train only in memory or temporary directories.
   prediction, portfolio analysis, and guarded persistence
 - `proposal_pipeline.py`: backward-compatible pipeline module and CLI entry
 - `data/universe.py`, `ticker_universe.json`: ticker configuration
-- `pages/`, `ui/`: page helpers and accessibility/theme behavior
+- `ui/page_components/`, `ui/`: page helpers and accessibility/theme behavior
 - `diagnose_model.py`: read-only saved-model diagnostics
 - `tests/`: focused pipeline and app tests
 - `proposal_pipeline_outputs/`: persisted models and metrics

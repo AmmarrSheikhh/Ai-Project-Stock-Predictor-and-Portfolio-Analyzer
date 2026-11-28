@@ -9,7 +9,12 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    VotingClassifier,
+)
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
@@ -41,7 +46,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "proposal_pipeline_outputs"
 TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
-HORIZON_DAYS = 5
+HORIZON_DAYS = 10
 
 TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
     "AAPL": ("aapl", "apple", "iphone", "ipad", "mac", "ios", "tim cook"),
@@ -55,19 +60,25 @@ TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
 BASE_FEATURES = [
     "Daily_Return",
     "Return_5d",
+    "Return_20d",
     "Volatility_10d",
-    "MA_10",
-    "MA_20",
+    "Volatility_20d",
     "Price_Range",
+    "ATR_Pct",
     "Volume_Change",
     "Volume_Ratio",
     "Close_MA10_Ratio",
     "Close_MA20_Ratio",
+    "MA10_MA20_Ratio",
+    "Bollinger_Z",
     "RSI_14",
-    "MACD",
-    "MACD_Signal",
-    "MACD_Hist",
+    "MACD_Pct",
+    "MACD_Hist_Pct",
     "Momentum_10d",
+    "Market_Return_1d",
+    "Market_Return_5d",
+    "Market_Volatility_10d",
+    "Alpha_5d",
 ]
 STOCK_FEATURES = BASE_FEATURES
 
@@ -98,6 +109,71 @@ NEGATIVE_WORDS = {
 
 class InputError(ValueError):
     pass
+
+
+def _make_base_ensemble() -> VotingClassifier:
+    rf = RandomForestClassifier(
+        n_estimators=250,
+        max_depth=6,
+        min_samples_leaf=12,
+        max_features="sqrt",
+        random_state=42,
+        n_jobs=-1,
+    )
+    hgb = HistGradientBoostingClassifier(
+        max_iter=180,
+        learning_rate=0.03,
+        max_depth=4,
+        min_samples_leaf=20,
+        l2_regularization=1.5,
+        random_state=42,
+    )
+    return VotingClassifier(
+        estimators=[("rf", rf), ("hgb", hgb)],
+        voting="soft",
+        weights=[1, 1],
+    )
+
+
+class PerTickerEnsemble(BaseEstimator, ClassifierMixin):
+    def __init__(self) -> None:
+        self.models_: dict[str, VotingClassifier] = {}
+        self.global_model_: VotingClassifier | None = None
+        self.classes_ = np.array([0, 1])
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, tickers: pd.Series | None = None) -> "PerTickerEnsemble":
+        self.global_model_ = _make_base_ensemble()
+        self.global_model_.fit(X[STOCK_FEATURES], y.astype(int))
+        self.models_ = {}
+
+        if tickers is not None:
+            for ticker, idx in tickers.groupby(tickers).groups.items():
+                y_sub = y.loc[idx].astype(int)
+                if len(y_sub) >= 80 and y_sub.nunique() == 2:
+                    sub_model = _make_base_ensemble()
+                    sub_model.fit(X.loc[idx, STOCK_FEATURES], y_sub)
+                    self.models_[str(ticker)] = sub_model
+        return self
+
+    def predict_proba(self, X: pd.DataFrame, tickers: pd.Series | None = None) -> np.ndarray:
+        if self.global_model_ is None:
+            raise InputError("Model has not been fitted yet.")
+        if tickers is None or not self.models_:
+            return self.global_model_.predict_proba(X[STOCK_FEATURES])
+
+        probs = self.global_model_.predict_proba(X[STOCK_FEATURES]).copy()
+        ticker_arr = tickers.astype(str).to_numpy()
+        for ticker, sub_model in self.models_.items():
+            mask = ticker_arr == ticker
+            if mask.any():
+                ticker_probs = sub_model.predict_proba(X.loc[mask, STOCK_FEATURES])
+                # Blend 75% ticker-specific specialist + 25% cross-stock global model
+                probs[mask] = 0.75 * ticker_probs + 0.25 * probs[mask]
+        return probs
+
+    def predict(self, X: pd.DataFrame, tickers: pd.Series | None = None) -> np.ndarray:
+        probs = self.predict_proba(X, tickers=tickers)[:, 1]
+        return (probs >= 0.5).astype(int)
 
 
 def read_table(path: str | Path) -> pd.DataFrame:
@@ -169,8 +245,12 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
 
     prices["Daily_Return"] = prices.groupby("Ticker")["Close"].pct_change()
     prices["Return_5d"] = prices.groupby("Ticker")["Close"].pct_change(5)
+    prices["Return_20d"] = prices.groupby("Ticker")["Close"].pct_change(20)
     prices["Volatility_10d"] = prices.groupby("Ticker")["Daily_Return"].transform(
         lambda values: values.rolling(10, min_periods=10).std()
+    )
+    prices["Volatility_20d"] = prices.groupby("Ticker")["Daily_Return"].transform(
+        lambda values: values.rolling(20, min_periods=20).std()
     )
     prices["MA_10"] = prices.groupby("Ticker")["Close"].transform(
         lambda values: values.rolling(10, min_periods=10).mean()
@@ -178,6 +258,25 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     prices["MA_20"] = prices.groupby("Ticker")["Close"].transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
+    std_20 = prices.groupby("Ticker")["Close"].transform(
+        lambda values: values.rolling(20, min_periods=20).std()
+    )
+    prices["Bollinger_Z"] = (prices["Close"] - prices["MA_20"]) / std_20.replace(0, np.nan)
+
+    prev_close = prices.groupby("Ticker")["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            prices["High"] - prices["Low"],
+            (prices["High"] - prev_close).abs(),
+            (prices["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_14 = true_range.groupby(prices["Ticker"]).transform(
+        lambda values: values.rolling(14, min_periods=14).mean()
+    )
+    prices["ATR_Pct"] = atr_14 / prices["Close"].replace(0, np.nan)
+
     prices["Price_Range"] = (prices["High"] - prices["Low"]) / prices["Close"]
     prices["Volume_Change"] = prices.groupby("Ticker")["Volume"].pct_change()
     vol_ma10 = prices.groupby("Ticker")["Volume"].transform(
@@ -186,6 +285,7 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     prices["Volume_Ratio"] = prices["Volume"] / vol_ma10.replace(0, np.nan)
     prices["Close_MA10_Ratio"] = prices["Close"] / prices["MA_10"] - 1
     prices["Close_MA20_Ratio"] = prices["Close"] / prices["MA_20"] - 1
+    prices["MA10_MA20_Ratio"] = prices["MA_10"] / prices["MA_20"] - 1
     prices["Momentum_10d"] = prices.groupby("Ticker")["Close"].pct_change(10)
 
     change = prices.groupby("Ticker")["Close"].diff()
@@ -215,6 +315,15 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
         lambda values: values.ewm(span=9, adjust=False).mean()
     )
     prices["MACD_Hist"] = prices["MACD"] - prices["MACD_Signal"]
+    prices["MACD_Pct"] = prices["MACD"] / prices["Close"].replace(0, np.nan)
+    prices["MACD_Hist_Pct"] = prices["MACD_Hist"] / prices["Close"].replace(0, np.nan)
+
+    # Cross-sectional market regime features across the tech universe
+    market_daily = prices.groupby("Date")["Daily_Return"].transform("mean")
+    prices["Market_Return_1d"] = market_daily
+    prices["Market_Return_5d"] = prices.groupby("Date")["Return_5d"].transform("mean")
+    prices["Market_Volatility_10d"] = prices.groupby("Date")["Volatility_10d"].transform("mean")
+    prices["Alpha_5d"] = prices["Return_5d"] - prices["Market_Return_5d"]
 
     prices[BASE_FEATURES] = prices[BASE_FEATURES].replace(
         [np.inf, -np.inf], np.nan
@@ -462,9 +571,15 @@ def add_targets(prices: pd.DataFrame) -> pd.DataFrame:
     return labeled.dropna(subset=STOCK_FEATURES + ["Target_Up"])
 
 
+def _predict_stock_proba(model: BaseEstimator, frame: pd.DataFrame) -> np.ndarray:
+    if isinstance(model, PerTickerEnsemble):
+        return model.predict_proba(frame[STOCK_FEATURES], tickers=frame["Ticker"])[:, 1]
+    return model.predict_proba(frame[STOCK_FEATURES])[:, 1]
+
+
 def train_and_evaluate(
     prices: pd.DataFrame, news: pd.DataFrame
-) -> tuple[RandomForestClassifier, Pipeline, dict, pd.DataFrame, pd.DataFrame]:
+) -> tuple[PerTickerEnsemble, Pipeline, dict, pd.DataFrame, pd.DataFrame]:
     news_model, news_metrics = train_news_model(news)
     merged = merge_daily_sentiment(prices, news)
     labeled = add_targets(merged)
@@ -480,21 +595,21 @@ def train_and_evaluate(
     if train.empty or test.empty:
         raise InputError("The data cannot produce a chronological 80/20 split.")
 
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=7,
-        min_samples_leaf=10,
-        max_features="sqrt",
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(train[STOCK_FEATURES], train["Target_Up"].astype(int))
+    model = PerTickerEnsemble()
+    model.fit(train[STOCK_FEATURES], train["Target_Up"].astype(int), tickers=train["Ticker"])
 
-    probabilities = model.predict_proba(test[STOCK_FEATURES])[:, 1]
-    predictions = model.predict(test[STOCK_FEATURES])
+    probabilities = _predict_stock_proba(model, test)
+    predictions = (probabilities >= 0.5).astype(int)
     test_output = test.copy()
     test_output["Predicted_Up"] = predictions
     test_output["Prediction_Probability"] = probabilities
+
+    high_conf_mask = np.abs(probabilities - 0.5) >= 0.08
+    high_conf_acc = (
+        float(accuracy_score(test_output.loc[high_conf_mask, "Target_Up"], predictions[high_conf_mask]))
+        if high_conf_mask.sum() >= 10
+        else float(accuracy_score(test_output["Target_Up"], predictions))
+    )
 
     ticker_stability = {}
     for ticker, group in test_output.groupby("Ticker"):
@@ -536,15 +651,8 @@ def train_and_evaluate(
         "BuyHold_Cumulative_Return": buy_hold_curve.reindex(strategy_curve.index).ffill().fillna(1.0).to_numpy(),
     })
 
-    final_model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=7,
-        min_samples_leaf=10,
-        max_features="sqrt",
-        random_state=42,
-        n_jobs=-1,
-    )
-    final_model.fit(labeled[STOCK_FEATURES], labeled["Target_Up"].astype(int))
+    final_model = PerTickerEnsemble()
+    final_model.fit(labeled[STOCK_FEATURES], labeled["Target_Up"].astype(int), tickers=labeled["Ticker"])
 
     metrics = {
         "stock_features": STOCK_FEATURES,
@@ -556,6 +664,7 @@ def train_and_evaluate(
         "accuracy": float(
             accuracy_score(test_output["Target_Up"], test_output["Predicted_Up"])
         ),
+        "high_confidence_accuracy": high_conf_acc,
         "f1": float(
             f1_score(
                 test_output["Target_Up"],
@@ -582,7 +691,7 @@ def write_json(path: Path, value: dict) -> None:
 
 
 def save_models(
-    stock_model: RandomForestClassifier,
+    stock_model: BaseEstimator,
     news_model: Pipeline,
     metrics: dict,
     backtest: pd.DataFrame,
@@ -598,7 +707,7 @@ def save_models(
     test_output.to_csv(OUT / "proposal_stock_test_predictions.csv", index=False)
 
 
-def load_models() -> tuple[RandomForestClassifier, Pipeline]:
+def load_models() -> tuple[BaseEstimator, Pipeline]:
     stock_path = OUT / "proposal_stock_model.joblib"
     news_path = OUT / "proposal_news_model.joblib"
     if not stock_path.exists() or not news_path.exists():
@@ -635,7 +744,7 @@ def score_news_headlines(
 
 
 def predict_with_models(
-    stock_model: RandomForestClassifier,
+    stock_model: BaseEstimator,
     news_model: Pipeline,
     prices: pd.DataFrame,
     news: pd.DataFrame,
@@ -650,11 +759,10 @@ def predict_with_models(
         usable.sort_values(["Ticker", "Date"])
         .groupby("Ticker", as_index=False)
         .tail(1)
+        .reset_index(drop=True)
     )
-    stock_probabilities = stock_model.predict_proba(
-        latest[STOCK_FEATURES]
-    )[:, 1]
-    stock_predictions = stock_model.predict(latest[STOCK_FEATURES])
+    stock_probabilities = _predict_stock_proba(stock_model, latest)
+    stock_predictions = (stock_probabilities >= 0.5).astype(int)
     stock_output = pd.DataFrame({
         "Ticker": latest["Ticker"].to_numpy(),
         "Price_Date": latest["Date"].to_numpy(),
@@ -832,6 +940,7 @@ def train_command(args: argparse.Namespace) -> int:
     )
     print("Proposal-aligned models retrained and saved.")
     print(f"Stock accuracy ({HORIZON_DAYS}d horizon): {metrics['accuracy']:.3f}")
+    print(f"High-confidence accuracy: {metrics['high_confidence_accuracy']:.3f}")
     print(f"Stock F1 ({HORIZON_DAYS}d horizon): {metrics['f1']:.3f}")
     print(f"News training rows (filtered): {metrics['news_model']['training_rows']}")
     print(f"News label distribution: {metrics['news_model']['label_distribution']}")

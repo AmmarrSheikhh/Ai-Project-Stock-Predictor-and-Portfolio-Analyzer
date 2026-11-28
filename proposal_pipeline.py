@@ -19,28 +19,57 @@ from sklearn.pipeline import Pipeline
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "proposal_pipeline_outputs"
 TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
+HORIZON_DAYS = 5  # 5-trading-day forward trend reduces single-day noise
+
+TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "AAPL": ("aapl", "apple", "iphone", "ipad", "mac", "ios", "tim cook"),
+    "AMZN": ("amzn", "amazon", "aws", "prime", "bezos", "jassy"),
+    "GOOGL": ("googl", "goog", "google", "alphabet", "youtube", "gemini", "android", "pichai"),
+    "META": ("meta", "facebook", "instagram", "whatsapp", "threads", "zuckerberg"),
+    "MSFT": ("msft", "microsoft", "azure", "windows", "copilot", "openai", "nadella"),
+    "NVDA": ("nvda", "nvidia", "geforce", "cuda", "blackwell", "hopper", "jensen huang"),
+}
 
 BASE_FEATURES = [
     "Daily_Return",
+    "Return_5d",
+    "Volatility_10d",
     "MA_10",
     "MA_20",
     "Price_Range",
     "Volume_Change",
+    "Volume_Ratio",
     "Close_MA10_Ratio",
     "Close_MA20_Ratio",
     "RSI_14",
     "MACD",
     "MACD_Signal",
+    "MACD_Hist",
+    "Momentum_10d",
 ]
-STOCK_FEATURES = BASE_FEATURES + ["News_Sentiment", "News_Sentiment_Count"]
+STOCK_FEATURES = BASE_FEATURES
 
 POSITIVE_WORDS = {
-    "beat", "growth", "gain", "gains", "buy", "bull", "bullish", "strong",
-    "success", "outlook", "upgrade", "record", "profit", "positive", "rise",
+    "beat", "beats", "beating", "growth", "grow", "grows", "growing",
+    "gain", "gains", "gained", "buy", "buys", "bull", "bullish",
+    "strong", "stronger", "strength", "success", "successful", "outlook",
+    "upgrade", "upgrades", "upgraded", "record", "profit", "profits",
+    "profitable", "positive", "rise", "rises", "rising", "rose",
+    "surge", "surges", "surging", "soar", "soars", "soaring",
+    "outperform", "outperforms", "rally", "rallies", "rebound",
+    "boom", "booming", "breakthrough", "expand", "expands", "expansion",
+    "partnership", "approve", "approved", "boost", "boosts", "win", "wins",
 }
 NEGATIVE_WORDS = {
-    "fall", "falls", "loss", "losses", "risk", "warning", "downgrade",
-    "weak", "decline", "lawsuit", "cut", "cuts", "negative", "crisis",
+    "fall", "falls", "falling", "fell", "loss", "losses", "lose", "loses",
+    "losing", "lost", "risk", "risks", "risky", "warn", "warns", "warning",
+    "downgrade", "downgrades", "downgraded", "weak", "weaker", "weakness",
+    "decline", "declines", "declining", "lawsuit", "lawsuits", "sue", "sued",
+    "cut", "cuts", "cutting", "negative", "crisis", "collapse", "collapses",
+    "plunge", "plunges", "plunging", "slump", "slumps", "drop", "drops",
+    "dropping", "miss", "misses", "missed", "layoff", "layoffs", "probe",
+    "antitrust", "ban", "banned", "block", "blocks", "fear", "fears",
+    "panic", "crash", "crashes", "bear", "bearish", "sell", "selloff",
 }
 
 
@@ -60,6 +89,22 @@ def read_table(path: str | Path) -> pd.DataFrame:
     if header.startswith(b"PK") or header.startswith(b"\xD0\xCF"):
         return pd.read_excel(file_path)
     return pd.read_csv(file_path)
+
+
+def is_mostly_english(text: str) -> bool:
+    cleaned = re.sub(r"[^A-Za-z0-9\s.,!?$%&'\"():;\-+/]", "", text)
+    if not text.strip():
+        return False
+    return (len(cleaned) / len(text)) >= 0.85
+
+
+def is_ticker_relevant(ticker: str, text: str) -> bool:
+    upper_ticker = str(ticker).upper().strip()
+    keywords = TICKER_KEYWORDS.get(upper_ticker)
+    if not keywords:
+        return True
+    lowered = text.lower()
+    return any(re.search(rf"\b{re.escape(kw)}\b", lowered) for kw in keywords)
 
 
 def weak_sentiment_label(text: str) -> int:
@@ -82,14 +127,18 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
         )
 
     prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce", utc=True)
-    prices["Date"] = prices["Date"].dt.tz_localize(None)
+    prices["Date"] = prices["Date"].dt.tz_localize(None).dt.normalize()
     numeric = ["Open", "High", "Low", "Close", "Volume"]
     for column in numeric:
         prices[column] = pd.to_numeric(prices[column], errors="coerce")
     prices = prices.dropna(subset=["Date", "Ticker"] + numeric)
-    prices = prices.sort_values(["Ticker", "Date"])
+    prices = prices.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     prices["Daily_Return"] = prices.groupby("Ticker")["Close"].pct_change()
+    prices["Return_5d"] = prices.groupby("Ticker")["Close"].pct_change(5)
+    prices["Volatility_10d"] = prices.groupby("Ticker")["Daily_Return"].transform(
+        lambda values: values.rolling(10, min_periods=10).std()
+    )
     prices["MA_10"] = prices.groupby("Ticker")["Close"].transform(
         lambda values: values.rolling(10, min_periods=10).mean()
     )
@@ -98,8 +147,13 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     )
     prices["Price_Range"] = (prices["High"] - prices["Low"]) / prices["Close"]
     prices["Volume_Change"] = prices.groupby("Ticker")["Volume"].pct_change()
+    vol_ma10 = prices.groupby("Ticker")["Volume"].transform(
+        lambda values: values.rolling(10, min_periods=10).mean()
+    )
+    prices["Volume_Ratio"] = prices["Volume"] / vol_ma10.replace(0, np.nan)
     prices["Close_MA10_Ratio"] = prices["Close"] / prices["MA_10"] - 1
     prices["Close_MA20_Ratio"] = prices["Close"] / prices["MA_20"] - 1
+    prices["Momentum_10d"] = prices.groupby("Ticker")["Close"].pct_change(10)
 
     change = prices.groupby("Ticker")["Close"].diff()
     gains = change.clip(lower=0)
@@ -127,6 +181,7 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     prices["MACD_Signal"] = prices.groupby("Ticker")["MACD"].transform(
         lambda values: values.ewm(span=9, adjust=False).mean()
     )
+    prices["MACD_Hist"] = prices["MACD"] - prices["MACD_Signal"]
 
     prices[BASE_FEATURES] = prices[BASE_FEATURES].replace(
         [np.inf, -np.inf], np.nan
@@ -194,13 +249,34 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
     if source is None:
         source = download_live_news()
     news = source.copy()
-    if "Headline" not in news.columns:
+    if "Headline" not in news.columns and "Clean_Headline" not in news.columns:
         raise InputError("News data must contain a Headline column.")
-    news["Headline"] = news["Headline"].fillna("").astype(str)
-    news = news[news["Headline"].str.strip().ne("")]
+
+    if "Clean_Headline" in news.columns:
+        headline_series = news["Clean_Headline"].fillna(news.get("Headline", ""))
+    else:
+        headline_series = news["Headline"]
+
+    news["Headline"] = headline_series.fillna("").astype(str).str.strip()
+    news = news[news["Headline"].ne("")]
 
     if "Ticker" not in news.columns:
         news["Ticker"] = "UNKNOWN"
+    else:
+        news["Ticker"] = news["Ticker"].fillna("UNKNOWN").astype(str).str.upper().str.strip()
+
+    english_mask = news["Headline"].map(is_mostly_english)
+    relevant_mask = [
+        is_ticker_relevant(t, h)
+        for t, h in zip(news["Ticker"], news["Headline"])
+    ]
+    filtered = news[english_mask & pd.Series(relevant_mask, index=news.index)].copy()
+    if len(filtered) >= 10:
+        news = filtered
+    elif english_mask.sum() >= 10:
+        news = news[english_mask].copy()
+
+    news = news.drop_duplicates(subset=["Ticker", "Headline"])
 
     if "PublishedAt" in news.columns:
         news["PublishedAt"] = pd.to_datetime(
@@ -219,32 +295,69 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
     else:
         news["Weak_Label"] = news["Headline"].map(weak_sentiment_label)
 
-    return news.dropna(subset=["Weak_Label"])
+    return news.dropna(subset=["Weak_Label"]).reset_index(drop=True)
 
 
 def merge_daily_sentiment(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFrame:
+    merged = prices.sort_values(["Ticker", "Date"]).copy()
+    merged["News_Sentiment"] = 0.0
+    merged["News_Sentiment_Count"] = 0
+
     if "News_Date" not in news.columns:
-        news["News_Date"] = pd.NaT
+        return merged
 
     dated = news.dropna(subset=["News_Date", "Ticker"]).copy()
-    dated["News_Date"] = pd.to_datetime(dated["News_Date"]).dt.normalize()
+    if dated.empty:
+        return merged
 
+    dated["News_Date"] = pd.to_datetime(dated["News_Date"]).dt.tz_localize(None).dt.normalize()
     daily = (
         dated.groupby(["Ticker", "News_Date"], as_index=False)
         .agg(
-            News_Sentiment=("Weak_Label", "mean"),
-            News_Sentiment_Count=("Weak_Label", "size"),
+            Raw_Sentiment=("Weak_Label", "mean"),
+            Raw_Count=("Weak_Label", "size"),
         )
-        .rename(columns={"News_Date": "Date"})
+        .sort_values(["Ticker", "News_Date"])
     )
-    daily["Date"] = pd.to_datetime(daily["Date"]).dt.tz_localize(None)
 
-    merged = prices.merge(daily, on=["Ticker", "Date"], how="left")
-    merged["News_Sentiment"] = merged["News_Sentiment"].fillna(0)
-    merged["News_Sentiment_Count"] = (
-        merged["News_Sentiment_Count"].fillna(0).astype(int)
-    )
-    return merged
+    aligned_frames = []
+    for ticker, price_group in merged.groupby("Ticker", sort=False):
+        pg = price_group.sort_values("Date").copy()
+        ng = daily[daily["Ticker"] == ticker].sort_values("News_Date")
+        if ng.empty:
+            aligned_frames.append(pg)
+            continue
+
+        joined = pd.merge_asof(
+            ng,
+            pg[["Date"]].drop_duplicates().sort_values("Date"),
+            left_on="News_Date",
+            right_on="Date",
+            direction="forward",
+            tolerance=pd.Timedelta(days=4),
+        ).dropna(subset=["Date"])
+
+        if joined.empty:
+            aligned_frames.append(pg)
+            continue
+
+        trading_day_news = (
+            joined.groupby("Date", as_index=False)
+            .agg(
+                Day_Sentiment=("Raw_Sentiment", "mean"),
+                Day_Count=("Raw_Count", "sum"),
+            )
+            .sort_values("Date")
+        )
+        pg = pg.merge(trading_day_news, on="Date", how="left")
+        pg["News_Sentiment"] = (
+            pg["Day_Sentiment"].fillna(0.0).rolling(3, min_periods=1).mean()
+        )
+        pg["News_Sentiment_Count"] = pg["Day_Count"].fillna(0).astype(int)
+        pg = pg.drop(columns=["Day_Sentiment", "Day_Count"])
+        aligned_frames.append(pg)
+
+    return pd.concat(aligned_frames, ignore_index=True).sort_values(["Ticker", "Date"])
 
 
 def train_news_model(news: pd.DataFrame) -> tuple[Pipeline, dict]:
@@ -254,12 +367,24 @@ def train_news_model(news: pd.DataFrame) -> tuple[Pipeline, dict]:
             "(-1/0/1) or Label (negative/neutral/positive)."
         )
     model = Pipeline([
-        ("tfidf", TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True)),
-        ("classifier", LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            random_state=42,
-        )),
+        (
+            "tfidf",
+            TfidfVectorizer(
+                ngram_range=(1, 2),
+                sublinear_tf=True,
+                stop_words="english",
+                min_df=1,
+            ),
+        ),
+        (
+            "classifier",
+            LogisticRegression(
+                max_iter=1000,
+                class_weight="balanced",
+                C=1.5,
+                random_state=42,
+            ),
+        ),
     ])
     model.fit(news["Headline"], news["Weak_Label"].astype(int))
     predicted = model.predict(news["Headline"])
@@ -278,8 +403,9 @@ def train_news_model(news: pd.DataFrame) -> tuple[Pipeline, dict]:
 def add_targets(prices: pd.DataFrame) -> pd.DataFrame:
     labeled = prices.copy()
     labeled["Next_Close"] = labeled.groupby("Ticker")["Close"].shift(-1)
-    labeled["Target_Up"] = (labeled["Next_Close"] > labeled["Close"]).astype(float)
-    labeled.loc[labeled["Next_Close"].isna(), "Target_Up"] = np.nan
+    labeled["Future_Close"] = labeled.groupby("Ticker")["Close"].shift(-HORIZON_DAYS)
+    labeled["Target_Up"] = (labeled["Future_Close"] > labeled["Close"]).astype(float)
+    labeled.loc[labeled["Future_Close"].isna(), "Target_Up"] = np.nan
     return labeled.dropna(subset=STOCK_FEATURES + ["Target_Up"])
 
 
@@ -294,16 +420,19 @@ def train_and_evaluate(
 
     dates = np.sort(labeled["Date"].unique())
     cutoff = dates[int(len(dates) * 0.8)]
-    train = labeled[labeled["Date"] < cutoff]
+    # Embargo gap of HORIZON_DAYS between train and test to prevent target overlap leakage
+    train = labeled[labeled["Date"] < cutoff].groupby("Ticker", group_keys=False).apply(
+        lambda g: g.iloc[:-HORIZON_DAYS] if len(g) > HORIZON_DAYS else g
+    )
     test = labeled[labeled["Date"] >= cutoff]
     if train.empty or test.empty:
         raise InputError("The data cannot produce a chronological 80/20 split.")
 
     model = RandomForestClassifier(
-        n_estimators=250,
-        max_depth=8,
-        min_samples_leaf=5,
-        class_weight="balanced",
+        n_estimators=300,
+        max_depth=7,
+        min_samples_leaf=10,
+        max_features="sqrt",
         random_state=42,
         n_jobs=-1,
     )
@@ -352,14 +481,14 @@ def train_and_evaluate(
     backtest = pd.DataFrame({
         "Date": strategy_curve.index,
         "Strategy_Cumulative_Return": strategy_curve.to_numpy(),
-        "BuyHold_Cumulative_Return": buy_hold_curve.reindex(strategy_curve.index).fillna(0).add(1).cumprod().to_numpy(),
+        "BuyHold_Cumulative_Return": buy_hold_curve.reindex(strategy_curve.index).ffill().fillna(1.0).to_numpy(),
     })
 
     final_model = RandomForestClassifier(
-        n_estimators=250,
-        max_depth=8,
-        min_samples_leaf=5,
-        class_weight="balanced",
+        n_estimators=300,
+        max_depth=7,
+        min_samples_leaf=10,
+        max_features="sqrt",
         random_state=42,
         n_jobs=-1,
     )
@@ -367,6 +496,7 @@ def train_and_evaluate(
 
     metrics = {
         "stock_features": STOCK_FEATURES,
+        "prediction_horizon_days": HORIZON_DAYS,
         "split": "chronological 80/20",
         "train_rows": int(len(train)),
         "test_rows": int(len(test)),
@@ -467,30 +597,36 @@ def predict_with_models(
         "News_Sentiment_Count": latest["News_Sentiment_Count"].to_numpy(),
     })
 
+    news_predictions["Weighted_Sentiment"] = (
+        news_predictions["Predicted_Sentiment"] * news_predictions["Sentiment_Confidence"]
+    )
     news_summary = (
         news_predictions.groupby("Ticker", as_index=False)
         .agg(
-            Predicted_Sentiment_Mean=("Predicted_Sentiment", "mean"),
+            Predicted_Sentiment_Mean=("Weighted_Sentiment", "mean"),
             Headline_Count=("Predicted_Sentiment", "size"),
             Mean_Sentiment_Confidence=("Sentiment_Confidence", "mean"),
         )
     )
     combined = stock_output.merge(news_summary, on="Ticker", how="left")
     combined["Predicted_Sentiment_Mean"] = (
-        combined["Predicted_Sentiment_Mean"].fillna(0)
+        combined["Predicted_Sentiment_Mean"].fillna(0.0)
     )
     combined["Headline_Count"] = (
         combined["Headline_Count"].fillna(0).astype(int)
     )
     combined["Mean_Sentiment_Confidence"] = (
-        combined["Mean_Sentiment_Confidence"].fillna(0)
+        combined["Mean_Sentiment_Confidence"].fillna(0.0)
     )
     combined["Sentiment_Signal"] = (
-        combined["Predicted_Sentiment_Mean"] + 1
-    ) / 2
-    combined["Combined_Signal"] = (
-        0.7 * combined["Prediction_Probability"]
-        + 0.3 * combined["Sentiment_Signal"]
+        combined["Predicted_Sentiment_Mean"] + 1.0
+    ) / 2.0
+
+    has_news = combined["Headline_Count"] > 0
+    combined["Combined_Signal"] = np.where(
+        has_news,
+        0.75 * combined["Prediction_Probability"] + 0.25 * combined["Sentiment_Signal"],
+        combined["Prediction_Probability"],
     )
     combined["Combined_Direction"] = np.where(
         combined["Combined_Signal"] >= 0.5,
@@ -503,7 +639,7 @@ def predict_with_models(
 def build_portfolio(
     prices: pd.DataFrame,
     combined: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     prepared = prepare_prices(prices)
     returns = prepared.pivot_table(
         index="Date",
@@ -625,8 +761,10 @@ def train_command(args: argparse.Namespace) -> int:
         test_output,
     )
     print("Proposal-aligned models retrained and saved.")
-    print(f"Stock accuracy: {metrics['accuracy']:.3f}")
-    print(f"Stock F1: {metrics['f1']:.3f}")
+    print(f"Stock accuracy ({HORIZON_DAYS}d horizon): {metrics['accuracy']:.3f}")
+    print(f"Stock F1 ({HORIZON_DAYS}d horizon): {metrics['f1']:.3f}")
+    print(f"News training rows (filtered): {metrics['news_model']['training_rows']}")
+    print(f"News label distribution: {metrics['news_model']['label_distribution']}")
     print(
         "Strategy cumulative return: "
         f"{metrics['strategy_final_return']:.2%}"

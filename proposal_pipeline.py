@@ -15,11 +15,33 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import Pipeline
 
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _VADER = SentimentIntensityAnalyzer()
+    _VADER.lexicon.update({
+        "beat": 2.4, "beats": 2.4, "beating": 2.4,
+        "outperform": 2.5, "outperforms": 2.5, "outperformed": 2.5,
+        "upgrade": 2.3, "upgrades": 2.3, "upgraded": 2.3,
+        "climbed": 2.2, "climb": 2.0, "soar": 2.6, "soars": 2.6, "soaring": 2.6,
+        "surge": 2.5, "surges": 2.5, "surging": 2.5,
+        "rally": 2.2, "rallies": 2.2, "rebound": 2.0,
+        "bullish": 2.4, "bull": 1.8, "winner": 2.2, "winners": 2.2,
+        "record": 1.8, "breakthrough": 2.4, "optimism": 2.1, "comeback": 2.0,
+        "miss": -2.3, "misses": -2.3, "missed": -2.3,
+        "downgrade": -2.4, "downgrades": -2.4, "downgraded": -2.4,
+        "plunge": -2.7, "plunges": -2.7, "plunging": -2.7,
+        "slump": -2.4, "slumps": -2.4, "collapse": -2.8, "collapses": -2.8,
+        "bearish": -2.4, "selloff": -2.5, "layoff": -2.3, "layoffs": -2.3,
+        "antitrust": -2.1, "lawsuit": -2.2, "probe": -1.9, "warning": -2.1, "warns": -2.1,
+    })
+except ImportError:
+    _VADER = None
+
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "proposal_pipeline_outputs"
 TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
-HORIZON_DAYS = 5  # 5-trading-day forward trend reduces single-day noise
+HORIZON_DAYS = 5
 
 TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
     "AAPL": ("aapl", "apple", "iphone", "ipad", "mac", "ios", "tim cook"),
@@ -59,6 +81,7 @@ POSITIVE_WORDS = {
     "outperform", "outperforms", "rally", "rallies", "rebound",
     "boom", "booming", "breakthrough", "expand", "expands", "expansion",
     "partnership", "approve", "approved", "boost", "boosts", "win", "wins",
+    "winner", "winners", "climbed", "climb", "optimism", "comeback",
 }
 NEGATIVE_WORDS = {
     "fall", "falls", "falling", "fell", "loss", "losses", "lose", "loses",
@@ -107,12 +130,22 @@ def is_ticker_relevant(ticker: str, text: str) -> bool:
     return any(re.search(rf"\b{re.escape(kw)}\b", lowered) for kw in keywords)
 
 
+def financial_compound_score(text: str) -> float:
+    raw = str(text).strip()
+    if not raw:
+        return 0.0
+    if _VADER is not None:
+        return float(_VADER.polarity_scores(raw)["compound"])
+    tokens = set(re.findall(r"[a-z]+", raw.lower()))
+    diff = len(tokens & POSITIVE_WORDS) - len(tokens & NEGATIVE_WORDS)
+    return float(np.clip(diff * 0.35, -1.0, 1.0))
+
+
 def weak_sentiment_label(text: str) -> int:
-    tokens = set(re.findall(r"[a-z]+", str(text).lower()))
-    score = len(tokens & POSITIVE_WORDS) - len(tokens & NEGATIVE_WORDS)
-    if score > 0:
+    score = financial_compound_score(text)
+    if score >= 0.12:
         return 1
-    if score < 0:
+    if score <= -0.12:
         return -1
     return 0
 
@@ -381,7 +414,7 @@ def train_news_model(news: pd.DataFrame) -> tuple[Pipeline, dict]:
             LogisticRegression(
                 max_iter=1000,
                 class_weight="balanced",
-                C=1.5,
+                C=2.0,
                 random_state=42,
             ),
         ),
@@ -420,7 +453,6 @@ def train_and_evaluate(
 
     dates = np.sort(labeled["Date"].unique())
     cutoff = dates[int(len(dates) * 0.8)]
-    # Embargo gap of HORIZON_DAYS between train and test to prevent target overlap leakage
     train = labeled[labeled["Date"] < cutoff].groupby("Ticker", group_keys=False).apply(
         lambda g: g.iloc[:-HORIZON_DAYS] if len(g) > HORIZON_DAYS else g
     )
@@ -557,6 +589,32 @@ def load_models() -> tuple[RandomForestClassifier, Pipeline]:
     return joblib.load(stock_path), joblib.load(news_path)
 
 
+def score_news_headlines(
+    news_model: Pipeline, prepared_news: pd.DataFrame
+) -> pd.DataFrame:
+    scored = prepared_news.copy()
+    if scored.empty:
+        scored["Predicted_Sentiment"] = pd.Series(dtype=int)
+        scored["Sentiment_Confidence"] = pd.Series(dtype=float)
+        scored["Sentiment_Label"] = pd.Series(dtype=str)
+        return scored
+
+    lr_pred = news_model.predict(scored["Headline"]).astype(int)
+    lr_conf = news_model.predict_proba(scored["Headline"]).max(axis=1)
+    vader_scores = scored["Headline"].map(financial_compound_score).to_numpy()
+    vader_pred = np.where(vader_scores >= 0.12, 1, np.where(vader_scores <= -0.12, -1, 0))
+
+    # Hybrid decision: trust Logistic Regression when confident, otherwise use VADER financial lexicon
+    final_pred = np.where(lr_conf >= 0.55, lr_pred, vader_pred)
+    final_conf = np.where(lr_conf >= 0.55, lr_conf, np.maximum(0.55, np.abs(vader_scores)))
+
+    label_names = {-1: "Negative", 0: "Neutral", 1: "Positive"}
+    scored["Predicted_Sentiment"] = final_pred
+    scored["Sentiment_Confidence"] = np.round(final_conf, 4)
+    scored["Sentiment_Label"] = [label_names[int(x)] for x in final_pred]
+    return scored
+
+
 def predict_with_models(
     stock_model: RandomForestClassifier,
     news_model: Pipeline,
@@ -565,14 +623,7 @@ def predict_with_models(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared_prices = prepare_prices(prices)
     prepared_news = prepare_news(news)
-
-    news_predictions = prepared_news.copy()
-    news_predictions["Predicted_Sentiment"] = news_model.predict(
-        news_predictions["Headline"]
-    )
-    news_predictions["Sentiment_Confidence"] = news_model.predict_proba(
-        news_predictions["Headline"]
-    ).max(axis=1)
+    news_predictions = score_news_headlines(news_model, prepared_news)
 
     merged = merge_daily_sentiment(prepared_prices, prepared_news)
     usable = merged.dropna(subset=STOCK_FEATURES)

@@ -160,7 +160,7 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
         )
 
     prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce", utc=True)
-    prices["Date"] = prices["Date"].dt.tz_localize(None).dt.normalize()
+    prices["Date"] = prices["Date"].dt.tz_localize(None).dt.normalize().astype("datetime64[ns]")
     numeric = ["Open", "High", "Low", "Close", "Volume"]
     for column in numeric:
         prices[column] = pd.to_numeric(prices[column], errors="coerce")
@@ -242,7 +242,7 @@ def download_live_prices(period: str) -> pd.DataFrame:
         if history.empty:
             raise InputError(f"No live price data was returned for {ticker}.")
         history = history.reset_index()
-        history["Date"] = pd.to_datetime(history["Date"], utc=True).dt.tz_localize(None)
+        history["Date"] = pd.to_datetime(history["Date"], utc=True).dt.tz_localize(None).astype("datetime64[ns]")
         history["Ticker"] = ticker
         frames.append(history[["Date", "Open", "High", "Low", "Close", "Volume", "Ticker"]])
     return pd.concat(frames, ignore_index=True)
@@ -315,7 +315,12 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
         news["PublishedAt"] = pd.to_datetime(
             news["PublishedAt"], errors="coerce", utc=True
         )
-        news["News_Date"] = news["PublishedAt"].dt.tz_localize(None).dt.normalize()
+        news["News_Date"] = (
+            news["PublishedAt"]
+            .dt.tz_localize(None)
+            .dt.normalize()
+            .astype("datetime64[ns]")
+        )
 
     if "Sentiment" in news.columns:
         labels = pd.to_numeric(news["Sentiment"], errors="coerce")
@@ -333,6 +338,7 @@ def prepare_news(source: pd.DataFrame | None) -> pd.DataFrame:
 
 def merge_daily_sentiment(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFrame:
     merged = prices.sort_values(["Ticker", "Date"]).copy()
+    merged["Date"] = pd.to_datetime(merged["Date"]).astype("datetime64[ns]")
     merged["News_Sentiment"] = 0.0
     merged["News_Sentiment_Count"] = 0
 
@@ -343,7 +349,12 @@ def merge_daily_sentiment(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFr
     if dated.empty:
         return merged
 
-    dated["News_Date"] = pd.to_datetime(dated["News_Date"]).dt.tz_localize(None).dt.normalize()
+    dated["News_Date"] = (
+        pd.to_datetime(dated["News_Date"])
+        .dt.tz_localize(None)
+        .dt.normalize()
+        .astype("datetime64[ns]")
+    )
     daily = (
         dated.groupby(["Ticker", "News_Date"], as_index=False)
         .agg(
@@ -356,14 +367,22 @@ def merge_daily_sentiment(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFr
     aligned_frames = []
     for ticker, price_group in merged.groupby("Ticker", sort=False):
         pg = price_group.sort_values("Date").copy()
-        ng = daily[daily["Ticker"] == ticker].sort_values("News_Date")
+        ng = daily[daily["Ticker"] == ticker].sort_values("News_Date").copy()
         if ng.empty:
             aligned_frames.append(pg)
             continue
 
+        ng["News_Date"] = ng["News_Date"].astype("datetime64[ns]")
+        price_dates = (
+            pg[["Date"]]
+            .drop_duplicates()
+            .sort_values("Date")
+            .assign(Date=lambda df: df["Date"].astype("datetime64[ns]"))
+        )
+
         joined = pd.merge_asof(
             ng,
-            pg[["Date"]].drop_duplicates().sort_values("Date"),
+            price_dates,
             left_on="News_Date",
             right_on="Date",
             direction="forward",
@@ -374,6 +393,7 @@ def merge_daily_sentiment(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFr
             aligned_frames.append(pg)
             continue
 
+        joined["Date"] = joined["Date"].astype("datetime64[ns]")
         trading_day_news = (
             joined.groupby("Date", as_index=False)
             .agg(
@@ -549,7 +569,7 @@ def train_and_evaluate(
         ) if len(strategy_curve) else 0.0,
         "buy_hold_final_return": float(
             buy_hold_curve.iloc[-1] - 1
-        ) if len(strategy_curve) else 0.0,
+        ) if len(buy_hold_curve) else 0.0,
         "news_model": news_metrics,
     }
     return final_model, news_model, metrics, test_output, backtest
@@ -604,7 +624,6 @@ def score_news_headlines(
     vader_scores = scored["Headline"].map(financial_compound_score).to_numpy()
     vader_pred = np.where(vader_scores >= 0.12, 1, np.where(vader_scores <= -0.12, -1, 0))
 
-    # Hybrid decision: trust Logistic Regression when confident, otherwise use VADER financial lexicon
     final_pred = np.where(lr_conf >= 0.55, lr_pred, vader_pred)
     final_conf = np.where(lr_conf >= 0.55, lr_conf, np.maximum(0.55, np.abs(vader_scores)))
 

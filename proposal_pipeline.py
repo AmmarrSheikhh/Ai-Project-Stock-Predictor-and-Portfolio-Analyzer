@@ -568,7 +568,7 @@ def add_targets(prices: pd.DataFrame) -> pd.DataFrame:
     labeled["Future_Close"] = labeled.groupby("Ticker")["Close"].shift(-HORIZON_DAYS)
     labeled["Target_Up"] = (labeled["Future_Close"] > labeled["Close"]).astype(float)
     labeled.loc[labeled["Future_Close"].isna(), "Target_Up"] = np.nan
-    return labeled.dropna(subset=STOCK_FEATURES + ["Target_Up"])
+    return labeled.dropna(subset=STOCK_FEATURES + ["Target_Up"]).reset_index(drop=True)
 
 
 def _predict_stock_proba(model: BaseEstimator, frame: pd.DataFrame) -> np.ndarray:
@@ -588,10 +588,11 @@ def train_and_evaluate(
 
     dates = np.sort(labeled["Date"].unique())
     cutoff = dates[int(len(dates) * 0.8)]
-    train = labeled[labeled["Date"] < cutoff].groupby("Ticker", group_keys=False).apply(
-        lambda g: g.iloc[:-HORIZON_DAYS] if len(g) > HORIZON_DAYS else g
-    )
-    test = labeled[labeled["Date"] >= cutoff]
+    train_parts = []
+    for _, group in labeled[labeled["Date"] < cutoff].groupby("Ticker", sort=False):
+        train_parts.append(group.iloc[:-HORIZON_DAYS] if len(group) > HORIZON_DAYS else group)
+    train = pd.concat(train_parts, ignore_index=True) if train_parts else labeled.iloc[0:0]
+    test = labeled[labeled["Date"] >= cutoff].reset_index(drop=True)
     if train.empty or test.empty:
         raise InputError("The data cannot produce a chronological 80/20 split.")
 
@@ -1009,7 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser = subparsers.add_parser("predict")
     predict_parser.add_argument("--stock-file")
     predict_parser.add_argument("--news-file")
-    predict_parser.add_argument("--period", default="1mo")
+    predict_parser.add_argument("--period", default="3mo")
     predict_parser.set_defaults(handler=predict_command)
     return parser
 

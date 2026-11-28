@@ -22,6 +22,7 @@ from proposal_pipeline import (  # noqa: E402
     prepare_news,
     prepare_prices,
     read_table,
+    score_news_headlines,
     train_and_evaluate,
     save_models,
 )
@@ -339,8 +340,8 @@ st.markdown(
 st.markdown(
     """
     <div class="hero">
-        <h1>AI-Driven Stock &amp; Portfolio Intelligence</h1>
-        <p>Live stock direction &bull; News sentiment &bull; Portfolio risk &bull; Proposal-aligned analysis</p>
+        <h1>AI-Driven Stock & Portfolio Intelligence</h1>
+        <p>Live stock direction • News sentiment • Portfolio risk • Proposal-aligned analysis</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -477,8 +478,8 @@ if page == "Predict":
     st.subheader("Stock and news prediction")
 
     st.info(
-        "Predictions use the currently saved proposal models. "
-        "Use Retrain to update the models."
+        "Predictions use the currently saved proposal models and automatic "
+        "hybrid sentiment scoring. Use Retrain to update the models."
     )
 
     if st.button("Run prediction", type="primary"):
@@ -500,8 +501,11 @@ if page == "Predict":
                 prices,
                 news,
             )
+            scored_news = score_news_headlines(news_model, prepare_news(news))
+
             st.session_state["stock_output"] = stock_output
             st.session_state["combined_output"] = combined
+            st.session_state["scored_news"] = scored_news
 
             if "News_Sentiment" in stock_output.columns:
                 st.success("Prediction complete.")
@@ -526,7 +530,7 @@ if page == "Predict":
             f"{stock_output['Prediction_Probability'].mean():.2%}",
         )
         overview[3].metric(
-            "Headlines",
+            "Relevant headlines",
             int(combined["Headline_Count"].fillna(0).sum()),
         )
 
@@ -748,6 +752,30 @@ if page == "Predict":
             "proposal_combined_predictions.csv",
         )
 
+        if "scored_news" in st.session_state:
+            scored_news = st.session_state["scored_news"]
+            visible_news = scored_news[
+                scored_news["Ticker"].astype(str).isin(visible_tickers)
+            ].copy()
+            if not visible_news.empty:
+                st.markdown("### Automatic news sentiment breakdown")
+                counts = visible_news["Sentiment_Label"].value_counts()
+                sent_cols = st.columns(3)
+                sent_cols[0].metric("Positive headlines", int(counts.get("Positive", 0)))
+                sent_cols[1].metric("Neutral headlines", int(counts.get("Neutral", 0)))
+                sent_cols[2].metric("Negative headlines", int(counts.get("Negative", 0)))
+
+                visible_news["Confidence"] = (
+                    visible_news["Sentiment_Confidence"] * 100
+                ).round(1).astype(str) + "%"
+                st.dataframe(
+                    visible_news[
+                        ["Ticker", "Headline", "Sentiment_Label", "Confidence"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
 
 elif page == "Portfolio":
     st.subheader("Portfolio risk and diversification")
@@ -950,6 +978,9 @@ elif page == "Model Status":
         st.write(f"**Accuracy:** {metrics.get('accuracy', 0):.2%}")
         st.write(f"**F1:** {metrics.get('f1', 0):.2%}")
         st.write(
+            f"**Prediction horizon:** {metrics.get('prediction_horizon_days', 5)} trading days"
+        )
+        st.write(
             f"**Training rows:** {metrics.get('final_training_rows', 'Unavailable')}"
         )
         st.write(
@@ -995,18 +1026,15 @@ else:
         """
         This project combines three proposed modules:
 
-        1. **Stock Trend Predictor** - Random Forest with technical features,
-           including RSI and MACD.
-        2. **News Sentiment Signal** - TF-IDF and Logistic Regression.
-           News sentiment is merged into the stock feature data.
-        3. **Portfolio Risk Analyzer** - covariance, correlation,
+        1. **Stock Trend Predictor** — Random Forest with technical indicators,
+           including RSI-14, MACD, moving average ratios, and momentum features.
+        2. **News Sentiment Signal** — Hybrid VADER financial lexicon + TF-IDF
+           Logistic Regression model that filters ticker-relevant headlines and
+           merges sentiment confidence into the combined signal.
+        3. **Portfolio Risk Analyzer** — Annualized covariance, correlation,
            inverse-volatility weights, and signal-adjusted allocations.
 
-        The UI does not implement a trading system. It does not place trades,
-        guarantee returns, or provide regulated financial advice.
-
-        News labels may be weakly generated where verified labels are absent.
-        Stock accuracy near 50% is close to random direction prediction.
+        The UI is an educational prototype and does not execute real trades
+        or provide financial advice.
         """
     )
-

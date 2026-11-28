@@ -9,12 +9,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.ensemble import (
-    HistGradientBoostingClassifier,
-    RandomForestClassifier,
-    VotingClassifier,
-)
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
@@ -46,7 +41,6 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "proposal_pipeline_outputs"
 TICKERS = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
-TICKER_TO_ID = {ticker: idx for idx, ticker in enumerate(TICKERS)}
 HORIZON_DAYS = 5
 
 TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -59,19 +53,21 @@ TICKER_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 BASE_FEATURES = [
-    "Ticker_ID",
     "Daily_Return",
     "Return_5d",
-    "Return_20d",
     "Volatility_10d",
-    "ATR_Pct",
+    "MA_10",
+    "MA_20",
+    "Price_Range",
+    "Volume_Change",
     "Volume_Ratio",
     "Close_MA10_Ratio",
     "Close_MA20_Ratio",
-    "Bollinger_Z",
     "RSI_14",
-    "MACD_Pct",
-    "Alpha_5d",
+    "MACD",
+    "MACD_Signal",
+    "MACD_Hist",
+    "Momentum_10d",
 ]
 STOCK_FEATURES = BASE_FEATURES
 
@@ -102,70 +98,6 @@ NEGATIVE_WORDS = {
 
 class InputError(ValueError):
     pass
-
-
-def _make_base_ensemble() -> VotingClassifier:
-    rf = RandomForestClassifier(
-        n_estimators=350,
-        max_depth=7,
-        min_samples_leaf=12,
-        max_features="sqrt",
-        random_state=42,
-        n_jobs=-1,
-    )
-    hgb = HistGradientBoostingClassifier(
-        max_iter=220,
-        learning_rate=0.03,
-        max_depth=5,
-        min_samples_leaf=25,
-        l2_regularization=1.5,
-        categorical_features=[0],
-        random_state=42,
-    )
-    return VotingClassifier(
-        estimators=[("rf", rf), ("hgb", hgb)],
-        voting="soft",
-        weights=[0.55, 0.45],
-    )
-
-
-class PooledCalibratedEnsemble(BaseEstimator, ClassifierMixin):
-    def __init__(self, threshold: float = 0.50) -> None:
-        self.threshold = float(threshold)
-        self.model_: VotingClassifier | None = None
-        self.classes_ = np.array([0, 1])
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "PooledCalibratedEnsemble":
-        self.model_ = _make_base_ensemble()
-        self.model_.fit(X[STOCK_FEATURES], y.astype(int))
-        return self
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        if self.model_ is None:
-            raise InputError("Model has not been fitted yet.")
-        return self.model_.predict_proba(X[STOCK_FEATURES])
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        probs = self.predict_proba(X)[:, 1]
-        return (probs >= self.threshold).astype(int)
-
-
-def _find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> float:
-    best_thresh = 0.50
-    best_score = -1.0
-    for candidate in np.linspace(0.46, 0.56, 21):
-        preds = (probs >= candidate).astype(int)
-        # Require reasonable class balance so model doesn't collapse to single-class predictions
-        pos_rate = preds.mean()
-        if pos_rate < 0.25 or pos_rate > 0.85:
-            continue
-        acc = accuracy_score(y_true, preds)
-        f1 = f1_score(y_true, preds, zero_division=0)
-        composite = 0.65 * acc + 0.35 * f1
-        if composite > best_score:
-            best_score = composite
-            best_thresh = float(round(candidate, 4))
-    return best_thresh
 
 
 def read_table(path: str | Path) -> pd.DataFrame:
@@ -233,13 +165,10 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     for column in numeric:
         prices[column] = pd.to_numeric(prices[column], errors="coerce")
     prices = prices.dropna(subset=["Date", "Ticker"] + numeric)
-    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
     prices = prices.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    prices["Ticker_ID"] = prices["Ticker"].map(TICKER_TO_ID).fillna(-1).astype(int)
     prices["Daily_Return"] = prices.groupby("Ticker")["Close"].pct_change()
     prices["Return_5d"] = prices.groupby("Ticker")["Close"].pct_change(5)
-    prices["Return_20d"] = prices.groupby("Ticker")["Close"].pct_change(20)
     prices["Volatility_10d"] = prices.groupby("Ticker")["Daily_Return"].transform(
         lambda values: values.rolling(10, min_periods=10).std()
     )
@@ -249,31 +178,15 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
     prices["MA_20"] = prices.groupby("Ticker")["Close"].transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
-    std_20 = prices.groupby("Ticker")["Close"].transform(
-        lambda values: values.rolling(20, min_periods=20).std()
-    )
-    prices["Bollinger_Z"] = (prices["Close"] - prices["MA_20"]) / std_20.replace(0, np.nan)
-
-    prev_close = prices.groupby("Ticker")["Close"].shift(1)
-    true_range = pd.concat(
-        [
-            prices["High"] - prices["Low"],
-            (prices["High"] - prev_close).abs(),
-            (prices["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr_14 = true_range.groupby(prices["Ticker"]).transform(
-        lambda values: values.rolling(14, min_periods=14).mean()
-    )
-    prices["ATR_Pct"] = atr_14 / prices["Close"].replace(0, np.nan)
-
+    prices["Price_Range"] = (prices["High"] - prices["Low"]) / prices["Close"]
+    prices["Volume_Change"] = prices.groupby("Ticker")["Volume"].pct_change()
     vol_ma10 = prices.groupby("Ticker")["Volume"].transform(
         lambda values: values.rolling(10, min_periods=10).mean()
     )
     prices["Volume_Ratio"] = prices["Volume"] / vol_ma10.replace(0, np.nan)
     prices["Close_MA10_Ratio"] = prices["Close"] / prices["MA_10"] - 1
     prices["Close_MA20_Ratio"] = prices["Close"] / prices["MA_20"] - 1
+    prices["Momentum_10d"] = prices.groupby("Ticker")["Close"].pct_change(10)
 
     change = prices.groupby("Ticker")["Close"].diff()
     gains = change.clip(lower=0)
@@ -298,11 +211,10 @@ def prepare_prices(source: pd.DataFrame) -> pd.DataFrame:
         lambda values: values.ewm(span=26, adjust=False).mean()
     )
     prices["MACD"] = ema_12 - ema_26
-    prices["MACD_Pct"] = prices["MACD"] / prices["Close"].replace(0, np.nan)
-
-    # Cross-sectional relative alpha against the tech universe
-    market_return_5d = prices.groupby("Date")["Return_5d"].transform("mean")
-    prices["Alpha_5d"] = prices["Return_5d"] - market_return_5d
+    prices["MACD_Signal"] = prices.groupby("Ticker")["MACD"].transform(
+        lambda values: values.ewm(span=9, adjust=False).mean()
+    )
+    prices["MACD_Hist"] = prices["MACD"] - prices["MACD_Signal"]
 
     prices[BASE_FEATURES] = prices[BASE_FEATURES].replace(
         [np.inf, -np.inf], np.nan
@@ -552,7 +464,7 @@ def add_targets(prices: pd.DataFrame) -> pd.DataFrame:
 
 def train_and_evaluate(
     prices: pd.DataFrame, news: pd.DataFrame
-) -> tuple[PooledCalibratedEnsemble, Pipeline, dict, pd.DataFrame, pd.DataFrame]:
+) -> tuple[RandomForestClassifier, Pipeline, dict, pd.DataFrame, pd.DataFrame]:
     news_model, news_metrics = train_news_model(news)
     merged = merge_daily_sentiment(prices, news)
     labeled = add_targets(merged)
@@ -561,8 +473,6 @@ def train_and_evaluate(
 
     dates = np.sort(labeled["Date"].unique())
     cutoff = dates[int(len(dates) * 0.8)]
-    val_cutoff = dates[int(len(dates) * 0.65)]
-
     train_parts = []
     for _, group in labeled[labeled["Date"] < cutoff].groupby("Ticker", sort=False):
         train_parts.append(group.iloc[:-HORIZON_DAYS] if len(group) > HORIZON_DAYS else group)
@@ -571,29 +481,23 @@ def train_and_evaluate(
     if train.empty or test.empty:
         raise InputError("The data cannot produce a chronological 80/20 split.")
 
-    # Calibrate probability threshold on chronological inner validation slice
-    sub_train = train[train["Date"] < val_cutoff]
-    sub_val = train[train["Date"] >= val_cutoff]
-    calibrated_threshold = 0.50
-    if len(sub_train) >= 100 and len(sub_val) >= 50:
-        cal_model = PooledCalibratedEnsemble(threshold=0.50)
-        cal_model.fit(sub_train[STOCK_FEATURES], sub_train["Target_Up"].astype(int))
-        val_probs = cal_model.predict_proba(sub_val[STOCK_FEATURES])[:, 1]
-        calibrated_threshold = _find_best_threshold(
-            sub_val["Target_Up"].to_numpy().astype(int),
-            val_probs,
-        )
-
-    model = PooledCalibratedEnsemble(threshold=calibrated_threshold)
+    model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=7,
+        min_samples_leaf=10,
+        max_features="sqrt",
+        random_state=42,
+        n_jobs=-1,
+    )
     model.fit(train[STOCK_FEATURES], train["Target_Up"].astype(int))
 
     probabilities = model.predict_proba(test[STOCK_FEATURES])[:, 1]
-    predictions = (probabilities >= calibrated_threshold).astype(int)
+    predictions = model.predict(test[STOCK_FEATURES])
     test_output = test.copy()
     test_output["Predicted_Up"] = predictions
     test_output["Prediction_Probability"] = probabilities
 
-    high_conf_mask = np.abs(probabilities - calibrated_threshold) >= 0.06
+    high_conf_mask = np.abs(probabilities - 0.5) >= 0.08
     high_conf_acc = (
         float(accuracy_score(test_output.loc[high_conf_mask, "Target_Up"], predictions[high_conf_mask]))
         if high_conf_mask.sum() >= 10
@@ -621,7 +525,7 @@ def train_and_evaluate(
         test_output["Next_Close"] / test_output["Close"]
     ) - 1
     strategy_returns = (
-        test_output["Prediction_Probability"].ge(calibrated_threshold).astype(float)
+        test_output["Prediction_Probability"].gt(0.5).astype(float)
         * test_output["Next_Day_Return"].fillna(0)
     )
     strategy_daily = (
@@ -640,13 +544,19 @@ def train_and_evaluate(
         "BuyHold_Cumulative_Return": buy_hold_curve.reindex(strategy_curve.index).ffill().fillna(1.0).to_numpy(),
     })
 
-    final_model = PooledCalibratedEnsemble(threshold=calibrated_threshold)
+    final_model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=7,
+        min_samples_leaf=10,
+        max_features="sqrt",
+        random_state=42,
+        n_jobs=-1,
+    )
     final_model.fit(labeled[STOCK_FEATURES], labeled["Target_Up"].astype(int))
 
     metrics = {
         "stock_features": STOCK_FEATURES,
         "prediction_horizon_days": HORIZON_DAYS,
-        "decision_threshold": calibrated_threshold,
         "split": "chronological 80/20",
         "train_rows": int(len(train)),
         "test_rows": int(len(test)),
@@ -681,7 +591,7 @@ def write_json(path: Path, value: dict) -> None:
 
 
 def save_models(
-    stock_model: BaseEstimator,
+    stock_model: RandomForestClassifier,
     news_model: Pipeline,
     metrics: dict,
     backtest: pd.DataFrame,
@@ -697,7 +607,7 @@ def save_models(
     test_output.to_csv(OUT / "proposal_stock_test_predictions.csv", index=False)
 
 
-def load_models() -> tuple[BaseEstimator, Pipeline]:
+def load_models() -> tuple[RandomForestClassifier, Pipeline]:
     stock_path = OUT / "proposal_stock_model.joblib"
     news_path = OUT / "proposal_news_model.joblib"
     if not stock_path.exists() or not news_path.exists():
@@ -734,7 +644,7 @@ def score_news_headlines(
 
 
 def predict_with_models(
-    stock_model: BaseEstimator,
+    stock_model: RandomForestClassifier,
     news_model: Pipeline,
     prices: pd.DataFrame,
     news: pd.DataFrame,
@@ -751,7 +661,9 @@ def predict_with_models(
         .tail(1)
         .reset_index(drop=True)
     )
-    stock_probabilities = stock_model.predict_proba(latest[STOCK_FEATURES])[:, 1]
+    stock_probabilities = stock_model.predict_proba(
+        latest[STOCK_FEATURES]
+    )[:, 1]
     stock_predictions = stock_model.predict(latest[STOCK_FEATURES])
     stock_output = pd.DataFrame({
         "Ticker": latest["Ticker"].to_numpy(),
@@ -796,9 +708,8 @@ def predict_with_models(
         0.75 * combined["Prediction_Probability"] + 0.25 * combined["Sentiment_Signal"],
         combined["Prediction_Probability"],
     )
-    threshold = getattr(stock_model, "threshold", 0.50)
     combined["Combined_Direction"] = np.where(
-        combined["Combined_Signal"] >= threshold,
+        combined["Combined_Signal"] >= 0.5,
         "UP",
         "DOWN",
     )
@@ -933,7 +844,6 @@ def train_command(args: argparse.Namespace) -> int:
     print(f"Stock accuracy ({HORIZON_DAYS}d horizon): {metrics['accuracy']:.3f}")
     print(f"High-confidence accuracy: {metrics['high_confidence_accuracy']:.3f}")
     print(f"Stock F1 ({HORIZON_DAYS}d horizon): {metrics['f1']:.3f}")
-    print(f"Calibrated threshold: {metrics['decision_threshold']:.4f}")
     print(f"News training rows (filtered): {metrics['news_model']['training_rows']}")
     print(f"News label distribution: {metrics['news_model']['label_distribution']}")
     print(
@@ -1001,7 +911,7 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser = subparsers.add_parser("predict")
     predict_parser.add_argument("--stock-file")
     predict_parser.add_argument("--news-file")
-    predict_parser.add_argument("--period", default="3mo")
+    predict_parser.add_argument("--period", default="1mo")
     predict_parser.set_defaults(handler=predict_command)
     return parser
 
